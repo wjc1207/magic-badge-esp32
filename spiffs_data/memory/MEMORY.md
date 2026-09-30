@@ -1,3 +1,3 @@
 # Long-term Memory
 
-(empty - MimiClaw will write memories here as it learns)
+(empty - Magic Badge will write memories here as it learns)

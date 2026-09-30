@@ -1,5 +1,5 @@
 ## two-layer config
-swarmclaw uses a two-layer configuration system:
+magic badge uses a two-layer configuration system:
 - Layer 1: Compile-time (menuconfig)
 - Layer 2: Run-time (web interface or CLI)
 
@@ -32,7 +32,7 @@ idf.py menuconfig
 
 Path:
 
-- `MimiClaw Optional Hardware Tools`
+- `MagicBadge Optional Hardware Tools`
   - `Enable RGB control tool`
   - `Enable camera capture tool`
   - `Enable BLE listener tool`
@@ -43,7 +43,7 @@ If a tool is disabled here, it is not compiled and uses zero code/RAM.
 
 After flashing, configure runtime feature toggles via onboarding portal:
 
-- Connect to `Swarmclaw-XXXX`
+- Connect to `MagicBadge-XXXX`
 - Open `http://192.168.4.1`
 - Go to `Features` section
 

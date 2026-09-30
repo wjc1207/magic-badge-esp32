@@ -1,4 +1,4 @@
-menu "Swarmclaw Optional Hardware Tools"
+menu "MagicBadge Optional Hardware Tools"
 
     config MIMI_TOOL_RGB_ENABLED
         bool "Enable RGB control tool"

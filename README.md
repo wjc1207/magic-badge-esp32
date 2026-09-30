@@ -1,23 +1,14 @@
-# swarmclaw: Pocket AI Assistant on a $5 Chip
-
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/swarmclaw_dark.png">
-    <img src="assets/swarmclaw.png" alt="swarmclaw" width="500" />
-  </picture>
-</p>
+# magic badge: let badges talk with each other
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
 </p>
 
-**A branch of existing project [mimiclaw](https://github.com/memovai/mimiclaw)**
+**The world's first agentic badge that can talk with each other on a $5 chip. No Linux. No Node.js. Just pure C**
 
-**The world's first agentic Shoulder-to-shoulder communication buddy on a $5 chip. No Linux. No Node.js. Just pure C**
+magic badge turns a tiny ESP32-S3 board into a agentic badge that can talk with each other. Plug it into USB power, connect to WiFi, and walk on the street to connect with others — all on a chip the size of a thumb. 
 
-Swarmclaw turns a tiny ESP32-S3 board into a agentic Shoulder-to-shoulder communication buddy. Plug it into USB power, connect to WiFi, and walk on the street to meet new friends, get icebreakers, share contact info, and more — all on a chip the size of a thumb. 
-
-## Meet Swarmclaw
+## Meet magic badge
 
 - **Tiny** — No Linux, no Node.js, no bloat — just pure C
 - **Handy** — Message it from Telegram or Feishu, it handles the rest
@@ -85,8 +76,8 @@ Swarmclaw turns a tiny ESP32-S3 board into a agentic Shoulder-to-shoulder commun
 # You need ESP-IDF v5.5+ installed first:
 # https://docs.espressif.com/projects/esp-idf/en/v5.5.2/esp32s3/get-started/
 
-git clone https://github.com/wjc1207/swarmclaw.git
-cd swarmclaw
+git clone https://github.com/wjc1207/magic-badge-esp32.git
+cd magic-badge-esp32
 
 idf.py set-target esp32s3
 ```
@@ -115,15 +106,15 @@ You can configure secrets in one of two ways:
 - e.g. `wifi_set MySSID MyPassword` or `set_tg_token 123456:ABC...`
 
 #### Method B: Using Web Configuration Portal
-- After first boot, the device will create a WiFi hotspot named `Swarmclaw-XXXX`
+- After first boot, the device will create a WiFi hotspot named `MagicBadge-XXXX`
 - Connect to this hotspot and visit `http://192.168.4.1`
 - Configure all secrets and settings in the web interface
 
 ## two-layer configuration
-swarmclaw uses a two-layer configuration system, see [config.md](config.md) for details.
+magic badge uses a two-layer configuration system, see [config.md](config.md) for details.
 
 ## Examples
-example use cases of swarmclaw, see [example.md](example.md) for details.
+example use cases of magic badge, see [example.md](example.md) for details.
 
 ## Features
 see [features.md](features.md) for detailed feature list and roadmap.
@@ -168,11 +159,11 @@ see [features.md](features.md) for detailed feature list and roadmap.
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=wjc1207%2Fswarmclaw&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=wjc1207%2Fmagic-badge-esp32&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=wjc1207/swarmclaw&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=wjc1207/swarmclaw&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=wjc1207/swarmclaw&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=wjc1207/magic-badge-esp32&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=wjc1207/magic-badge-esp32&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=wjc1207/magic-badge-esp32&type=date&legend=top-left" />
  </picture>
 </a>
 
@@ -182,5 +173,5 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## Links
 
-- [mimiclaw](https://github.com/memovai/mimiclaw) - Main project
+- Special thanks to the [mimiclaw](https://github.com/memovai/mimiclaw) project
 - Author: Junchi Wang

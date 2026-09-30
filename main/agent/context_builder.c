@@ -12,8 +12,8 @@
 static const char *TAG = "context";
 
 static const char *DEFAULT_IDENTITY_PROMPT =
-    "# MimiClaw\n\n"
-    "You are MimiClaw, a personal AI assistant running on an ESP32-S3 device.\n"
+    "# Magic Badge\n\n"
+    "You are Magic Badge, a personal AI assistant running on an ESP32-S3 device.\n"
     "You communicate through Telegram and WebSocket.\n\n"
     "Be helpful, accurate, and concise.\n\n";
 

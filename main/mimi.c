@@ -120,7 +120,7 @@ void app_main(void)
     esp_log_level_set("esp-x509-crt-bundle", ESP_LOG_WARN);
 
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  MimiClaw - ESP32-S3 AI Agent");
+    ESP_LOGI(TAG, "  Magic Badge - ESP32-S3 AI Agent");
     ESP_LOGI(TAG, "========================================");
 
     /* Print memory info */
@@ -221,5 +221,5 @@ void app_main(void)
     ESP_LOGI(TAG, "PSRAM free:    %d bytes",
              (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    ESP_LOGI(TAG, "MimiClaw ready. Type 'help' for CLI commands.");
+    ESP_LOGI(TAG, "Magic Badge ready. Type 'help' for CLI commands.");
 }

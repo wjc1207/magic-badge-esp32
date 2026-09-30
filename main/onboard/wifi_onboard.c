@@ -801,7 +801,7 @@ esp_err_t wifi_onboard_start(wifi_onboard_mode_t mode)
     httpd_handle_t server = start_http_server(captive);
     if (!server) return ESP_FAIL;
 
-    ESP_LOGI(TAG, "Connect to MimiClaw-XXXX WiFi, then open http://192.168.4.1");
+    ESP_LOGI(TAG, "Connect to MagicBadge-XXXX WiFi, then open http://192.168.4.1");
 
     if (!captive) {
         ESP_LOGI(TAG, "Local admin portal stays available while STA is connected");

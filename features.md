@@ -1,5 +1,5 @@
 ## Feat. 1. lua scripting support
-- Swarmclaw integrates Lua scripting support, allowing ai agents to write and execute Lua scripts for dynamic behavior, task automation, and on-the-fly adjustments to their operations, enhancing flexibility and adaptability in various scenarios
+- magic badge integrates Lua scripting support, allowing ai agents to write and execute Lua scripts for dynamic behavior, task automation, and on-the-fly adjustments to their operations, enhancing flexibility and adaptability in various scenarios
 
 ## Feat. 2. social buddy
 

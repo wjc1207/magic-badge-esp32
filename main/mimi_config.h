@@ -2,7 +2,7 @@
 
 #include "sdkconfig.h"
 
-/* MimiClaw Global Configuration */
+/* Magic Badge Global Configuration */
 
 /* Optional feature toggles */
 
@@ -72,7 +72,7 @@
 #define MIMI_SECRET_SEARCH_PROVIDER "tavily"
 #endif
 #ifndef MIMI_ONBOARD_AP_PREFIX
-#define MIMI_ONBOARD_AP_PREFIX    "MimiClaw-"
+#define MIMI_ONBOARD_AP_PREFIX    "MagicBadge-"
 #endif
 #ifndef MIMI_ONBOARD_AP_PASS
 #define MIMI_ONBOARD_AP_PASS      "12345678"  /* WPA2 requires at least 8 chars */

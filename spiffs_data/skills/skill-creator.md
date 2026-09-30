@@ -1,6 +1,6 @@
 # Skill Creator
 
-Create new skills for MimiClaw.
+Create new skills for Magic Badge.
 
 ## When to use
 When the user asks to create a new skill, teach the bot something, or add a new capability.

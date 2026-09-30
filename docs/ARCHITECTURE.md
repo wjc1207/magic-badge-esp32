@@ -1,4 +1,4 @@
-# MimiClaw Architecture
+# Magic Badge Architecture
 
 > ESP32-S3 AI Agent firmware — C/FreeRTOS implementation running on bare metal (no Linux).
 
@@ -13,7 +13,7 @@ Telegram App (User)
     │
     ▼
 ┌──────────────────────────────────────────────────┐
-│               ESP32-S3 (MimiClaw)                │
+│              ESP32-S3 (Magic Badge)              │
 │                                                  │
 │   ┌─────────────┐       ┌──────────────────┐     │
 │   │  Telegram    │──────▶│   Inbound Queue  │     │
@@ -381,7 +381,7 @@ The CLI provides debug and maintenance commands only. All configuration is done 
 
 ## Nanobot Reference Mapping
 
-| Nanobot Module              | MimiClaw Equivalent            | Notes                        |
+| Nanobot Module              | Magic Badge Equivalent            | Notes                        |
 |-----------------------------|--------------------------------|------------------------------|
 | `agent/loop.py`             | `agent/agent_loop.c`           | ReAct loop with tool use     |
 | `agent/context.py`          | `agent/context_builder.c`      | Loads SOUL.md + USER.md + memory + tool guidance |
