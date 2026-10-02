@@ -126,6 +126,23 @@ see [features.md](features.md) for detailed feature list and roadmap.
 | **Telegram** | Native Telegram bot interface | Full command support, file attachments, inline queries |
 | **Feishu** | Feishu/Lark robot integration | Enterprise messaging, group chat support |
 
+> **Enable only one channel at a time.** Each channel holds its own TLS
+> connection open, and the LLM proxy opens another one per inference. The
+> internal DRAM left over after WiFi, BLE and TLS is only enough for about two
+> of these at once: with Telegram, Feishu and an LLM call all live, the TLS
+> write path fails to allocate its AES-GCM buffer and every inference dies with
+> `esp-aes: Failed to allocate memory` /
+> `transport_base: esp_tls_conn_write error`.
+>
+> That failure looks like a crypto bug and is really a memory budget problem, so
+> turn off the channels you are not using:
+>
+> ```
+> set_feature telegram_bot 0
+> set_feature feishu_bot 0
+> restart
+> ```
+
 ## Tools
 
 | Tool | Usage | 

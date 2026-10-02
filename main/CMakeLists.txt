@@ -33,6 +33,7 @@ set(srcs
     "buddy/buddy_proximity.c"
     "buddy/buddy_contacts.c"
     "buddy/buddy_ble.c"
+    "buddy/buddy_chat.c"
     "buddy/buddy_agent.c"
 )
 

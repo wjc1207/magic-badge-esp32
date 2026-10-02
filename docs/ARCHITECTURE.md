@@ -279,6 +279,30 @@ Client `chat_id` is auto-assigned on connection (`ws_<fd>`) but can be overridde
 
 ---
 
+## TLS budget (internal DRAM)
+
+Every channel plus every inference holds a TLS connection open, and TLS is the
+one subsystem that cannot fall back to PSRAM: its AES-GCM write path needs a
+small **internal DRAM** buffer. Internal DRAM is also what pays for the WiFi
+stack, the BLE controller, and every FreeRTOS task stack (`pvPortMalloc` is
+pinned to `MALLOC_CAP_INTERNAL`).
+
+In practice that budget covers about **two concurrent TLS clients**. With
+Telegram polling, the Feishu WebSocket *and* an LLM call all live, the write
+path fails to allocate and the failure surfaces far away from its cause:
+
+```
+E esp-aes: Failed to allocate memory
+E esp-tls-mbedtls: write error :-0x0001
+E transport_base: esp_tls_conn_write error, errno=Connection already in progress
+```
+
+The inference then fails even though PSRAM still has megabytes free. Keep one
+message channel enabled at a time (`set_feature telegram_bot 0`,
+`set_feature feishu_bot 0`, then `restart`).
+
+---
+
 ## Claude API Integration
 
 Endpoint: `POST https://api.anthropic.com/v1/messages`

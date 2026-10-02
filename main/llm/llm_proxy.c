@@ -706,6 +706,82 @@ static cJSON *convert_messages_openai(const char *system_prompt, cJSON *messages
 
 /* ── Public: simple chat (backward compat) ────────────────────── */
 
+/* Drop bytes that cannot be part of valid UTF-8.
+ *
+ * ESP-IDF's cJSON copies strings byte for byte and never validates them, so a
+ * buffer that was truncated mid-character — a transcript hitting its byte limit,
+ * a BLE frame cut at a byte boundary, a profile field from a web form — reaches
+ * the provider as a malformed sequence.  The API rejects the entire request:
+ *
+ *     Failed to parse the request body as JSON: messages[0].content:
+ *     invalid unicode code point at line 1 column 1978
+ *
+ * The column points into a request the badge cannot even print faithfully, so
+ * hunting the originating buffer is a poor use of time.  This is the one place
+ * every request passes through, so the malformed bytes are removed here and the
+ * rest of the text still gets through. */
+static void utf8_sanitize_inplace(char *s)
+{
+    if (!s) return;
+
+    unsigned char *buf = (unsigned char *)s;
+    size_t in  = 0;   /* read position  */
+    size_t out = 0;   /* write position; never ahead of `in`, hence safe in place */
+
+    while (buf[in] != '\0') {
+        unsigned char c = buf[in];
+        size_t need;
+
+        if (c < 0x80) {
+            buf[out++] = buf[in++];
+            continue;
+        }
+
+        if ((c & 0xE0) == 0xC0)      need = 2;
+        else if ((c & 0xF0) == 0xE0) need = 3;
+        else if ((c & 0xF8) == 0xF0) need = 4;
+        else { in++; continue; }     /* stray continuation byte */
+
+        size_t have = 1;
+        while (have < need && buf[in + have] != '\0' &&
+               (buf[in + have] & 0xC0) == 0x80) {
+            have++;
+        }
+
+        if (have == need) {
+            for (size_t k = 0; k < need; k++) {
+                buf[out++] = buf[in + k];
+            }
+            in += need;
+        } else {
+            /* Truncated sequence — normally the tail of a buffer that ran out of
+             * room.  Drop the lead byte and whatever continuation bytes were
+             * present; the text already copied stays where it is. */
+            in += have;
+        }
+    }
+
+    s[out] = '\0';
+}
+
+/* Same treatment for every string inside a parsed messages array: the content
+ * of a message is where free text ends up, and it may have been copied from a
+ * buffer that was already cut mid-character. */
+static void utf8_sanitize_json(cJSON *node)
+{
+    if (!node) return;
+
+    if (cJSON_IsString(node) && node->valuestring) {
+        utf8_sanitize_inplace(node->valuestring);
+        return;
+    }
+
+    cJSON *child = NULL;
+    cJSON_ArrayForEach(child, node) {
+        utf8_sanitize_json(child);
+    }
+}
+
 esp_err_t llm_chat(const char *system_prompt, const char *messages_json,
                    char *response_buf, size_t buf_size)
 {
@@ -723,32 +799,57 @@ esp_err_t llm_chat(const char *system_prompt, const char *messages_json,
         cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
     }
 
+    /* This one goes into the body as well (as the fallback content when the
+     * history will not parse), so it gets the same treatment. */
+    char *messages_copy = messages_json ? strdup(messages_json) : NULL;
+
     if (s_llm_provider != LLM_PROVIDER_ANTHROPIC) {
-        cJSON *messages = cJSON_Parse(messages_json);
+        cJSON *messages = messages_copy ? cJSON_Parse(messages_copy) : NULL;
         if (!messages) {
             messages = cJSON_CreateArray();
             cJSON *msg = cJSON_CreateObject();
             cJSON_AddStringToObject(msg, "role", "user");
-            cJSON_AddStringToObject(msg, "content", messages_json);
+            cJSON_AddItemToObject(msg, "content",
+                                  cJSON_CreateString(messages_copy ? messages_copy : ""));
             cJSON_AddItemToArray(messages, msg);
         }
+        utf8_sanitize_json(messages);
         cJSON *openai_msgs = convert_messages_openai(system_prompt, messages);
         cJSON_Delete(messages);
+        utf8_sanitize_json(openai_msgs);
         cJSON_AddItemToObject(body, "messages", openai_msgs);
     } else {
-        cJSON_AddStringToObject(body, "system", system_prompt);
-        cJSON *messages = cJSON_Parse(messages_json);
+        /* The system prompt is caller-owned (often a static buffer), so it gets a
+         * sanitized copy rather than being edited in place. */
+        char *sys_copy = system_prompt ? strdup(system_prompt) : NULL;
+        if (sys_copy) utf8_sanitize_inplace(sys_copy);
+        cJSON_AddStringToObject(body, "system", sys_copy ? sys_copy : "");
+        free(sys_copy);
+
+        cJSON *messages = messages_copy ? cJSON_Parse(messages_copy) : NULL;
         if (messages) {
+            utf8_sanitize_json(messages);
             cJSON_AddItemToObject(body, "messages", messages);
         } else {
             cJSON *arr = cJSON_CreateArray();
             cJSON *msg = cJSON_CreateObject();
             cJSON_AddStringToObject(msg, "role", "user");
-            cJSON_AddStringToObject(msg, "content", messages_json);
+            cJSON_AddItemToObject(msg, "content",
+                                  cJSON_CreateString(messages_copy ? messages_copy : ""));
             cJSON_AddItemToArray(arr, msg);
             cJSON_AddItemToObject(body, "messages", arr);
         }
     }
+
+    free(messages_copy);
+
+    /* cJSON never validates UTF-8: print_string_ptr() escapes control characters
+     * and copies every other byte verbatim, so one truncated multi-byte
+     * character anywhere in this tree reaches the provider as a malformed
+     * sequence and the whole request is rejected.  This is the single point every
+     * request passes through, so it is the one place worth guarding — it covers
+     * the parts assembled above as well as anything nested inside them. */
+    utf8_sanitize_json(body);
 
     char *post_data = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
@@ -875,6 +976,10 @@ esp_err_t llm_chat_tools(const char *system_prompt,
             }
         }
     }
+
+    /* Same guard as llm_chat(): tool results are arbitrary text from tools, and
+     * any truncated multi-byte character in them would fail the whole request. */
+    utf8_sanitize_json(body);
 
     char *post_data = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);

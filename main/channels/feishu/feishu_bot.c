@@ -14,6 +14,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_timer.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "nvs.h"
 #include "cJSON.h"
 
@@ -615,6 +616,37 @@ static void feishu_ws_event_handler(void *arg, esp_event_base_t base, int32_t ev
     }
 }
 
+/* Pick a stack size the internal heap can actually satisfy.
+ *
+ * esp_websocket_client spawns its own task, and IDF's pvPortMalloc is pinned to
+ * MALLOC_CAP_INTERNAL — a task stack can never come from PSRAM.  Asking for the
+ * full MIMI_FEISHU_WS_STACK therefore fails outright whenever internal DRAM is
+ * fragmented, and the component only reports "Error create websocket task",
+ * which reads like a transport bug rather than an allocation one.  That is
+ * exactly how a BLE chat session came to take the Feishu link down with it:
+ * bringing up the buddy link fragments internal DRAM below 8 KB and the WS task
+ * could no longer be created.
+ *
+ * xTaskCreate also needs the TCB out of the same heap, so the largest free
+ * block has to cover stack + TCB + alignment: keep a margin rather than
+ * spending the last byte. */
+static int feishu_ws_pick_stack(void)
+{
+    static const int candidates[] = {
+        MIMI_FEISHU_WS_STACK, 4096, 3072, 2048,
+    };
+    const size_t margin = 1024;   /* TCB + alignment + breathing room */
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if ((size_t)candidates[i] + margin <= largest) return candidates[i];
+    }
+
+    /* Nothing fits comfortably; report the smallest viable size and let
+     * xTaskCreate decide, so the caller still logs a real number. */
+    return candidates[sizeof(candidates) / sizeof(candidates[0]) - 1];
+}
+
 static void feishu_ws_task(void *arg)
 {
     (void)arg;
@@ -624,10 +656,13 @@ static void feishu_ws_task(void *arg)
             continue;
         }
 
+        int ws_stack = feishu_ws_pick_stack();
+
         esp_websocket_client_config_t ws_cfg = {
             .uri = s_ws_url,
             .buffer_size = 2048,
-            .task_stack = MIMI_FEISHU_POLL_STACK,
+            .task_stack = ws_stack,
+            .task_name = MIMI_FEISHU_WS_TASK_NAME,
             .reconnect_timeout_ms = s_ws_reconnect_interval_ms,
             .network_timeout_ms = 10000,
             .disable_auto_reconnect = false,
@@ -640,11 +675,33 @@ static void feishu_ws_task(void *arg)
             continue;
         }
         esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY, feishu_ws_event_handler, NULL);
-        esp_websocket_client_start(s_ws_client);
+
+        ESP_LOGI(TAG, "Starting WS client (stack %d B, internal free %u, largest block %u)",
+                 ws_stack,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+        esp_err_t ws_err = esp_websocket_client_start(s_ws_client);
+        if (ws_err != ESP_OK) {
+            ESP_LOGE(TAG, "WS client start failed: %s", esp_err_to_name(ws_err));
+        }
 
         int64_t last_ping = 0;
+        bool headroom_logged = false;
         while (s_ws_client) {
             if (s_ws_connected) {
+                if (!headroom_logged) {
+                    /* The TLS handshake runs on that task, so its headroom is
+                     * only meaningful once the socket is actually up.  If this
+                     * approaches zero, MIMI_FEISHU_WS_STACK is too small. */
+                    TaskHandle_t ws_task = xTaskGetHandle(MIMI_FEISHU_WS_TASK_NAME);
+                    if (ws_task) {
+                        ESP_LOGI(TAG, "WS task stack headroom after connect: %u bytes",
+                                 (unsigned)(uxTaskGetStackHighWaterMark(ws_task) * sizeof(StackType_t)));
+                    }
+                    headroom_logged = true;
+                }
+
                 int64_t now = esp_timer_get_time() / 1000;
                 if (now - last_ping >= s_ws_ping_interval_ms) {
                     ws_frame_t ping = {0};

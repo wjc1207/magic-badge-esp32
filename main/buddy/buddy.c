@@ -2,6 +2,7 @@
 #include "buddy_profile.h"
 #include "buddy_contacts.h"
 #include "buddy_ble.h"
+#include "buddy_chat.h"
 #include "buddy_agent.h"
 
 #include "esp_log.h"
@@ -40,6 +41,13 @@ esp_err_t buddy_init(void)
         return err;
     }
 
+    /* 5. Initialize the chat session module */
+    err = buddy_chat_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Chat init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
     ESP_LOGI(TAG, "Buddy subsystem initialized");
     return ESP_OK;
 }
@@ -63,12 +71,21 @@ esp_err_t buddy_start(void)
         return err;
     }
 
+    /* Start conversation sessions */
+    err = buddy_chat_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Chat start failed: %s", esp_err_to_name(err));
+        buddy_ble_stop();
+        return err;
+    }
+
     ESP_LOGI(TAG, "Buddy subsystem started — discovering peers");
     return ESP_OK;
 }
 
 esp_err_t buddy_stop(void)
 {
+    buddy_chat_stop();
     buddy_ble_stop();
     buddy_led_set(BUDDY_LED_PATTERN_OFF);
     ESP_LOGI(TAG, "Buddy subsystem stopped");

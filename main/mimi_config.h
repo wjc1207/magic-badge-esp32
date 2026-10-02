@@ -97,6 +97,22 @@
 #define MIMI_FEISHU_POLL_STACK       (12 * 1024)
 #define MIMI_FEISHU_POLL_PRIO        5
 #define MIMI_FEISHU_POLL_CORE        0
+
+/* esp_websocket_client spawns a task of its own, and IDF task stacks can only
+ * come from internal DRAM (pvPortMalloc is pinned to MALLOC_CAP_INTERNAL).
+ * That task is created *after* the TLS config pull has churned the heap, when
+ * the largest contiguous internal block is well under 12 KB — so this value has
+ * to stay below MIMI_FEISHU_POLL_STACK, even though it also does a TLS
+ * handshake.  The component's own default is only 4 KB.
+ *
+ * This is the *preferred* size, not a demand: feishu_ws_task() probes the
+ * largest free internal block and steps down (4096/3072/2048) when it cannot be
+ * met.  A hard 8 KB was a real regression — bringing up a BLE buddy link
+ * fragments internal DRAM below that, after which every attempt to start the
+ * Feishu link failed with "Error create websocket task" while the rest of the
+ * firmware looked healthy. */
+#define MIMI_FEISHU_WS_STACK         (5 * 1024)
+#define MIMI_FEISHU_WS_TASK_NAME     "feishu_ws_cli"
 #define MIMI_FEISHU_WEBHOOK_PORT     18790
 #define MIMI_FEISHU_WEBHOOK_PATH     "/feishu/events"
 #define MIMI_FEISHU_WEBHOOK_MAX_BODY (16 * 1024)
@@ -183,8 +199,6 @@
 #define MIMI_NVS_KEY_FEISHU_BOT      "feishu_bot"
 #define MIMI_NVS_KEY_LAST_SRC_CHANNEL "last_chan"
 #define MIMI_NVS_KEY_LAST_SRC_CHAT_ID "last_chid"
-#define MIMI_NVS_KEY_BUDDY_NOTIFY_CHANNEL "buddy_chan"
-#define MIMI_NVS_KEY_BUDDY_NOTIFY_CHAT_ID "buddy_chid"
 #define MIMI_NVS_KEY_CAMERA_FRAME_SIZE "cam_frame_size"
 #define MIMI_NVS_KEY_CAMERA_JPEG_QUALITY "cam_jpeg_qual"
 #define MIMI_NVS_KEY_CAM_PIN_PWDN    "cam_pin_pwdn"
@@ -234,4 +248,7 @@
 #define MIMI_BUDDY_BEACON_STACK     (4 * 1024)
 #define MIMI_BUDDY_BEACON_PRIO      4
 #define MIMI_BUDDY_BEACON_CORE      0
+#define MIMI_BUDDY_CHAT_STACK       (8 * 1024)
+#define MIMI_BUDDY_CHAT_PRIO        5
+#define MIMI_BUDDY_CHAT_CORE        1
 #define MIMI_BUDDY_NVS_NS           "buddy"

@@ -65,3 +65,12 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=16
 CONFIG_BT_NIMBLE_ACL_BUF_COUNT=24
+# The ACL buffers must be at least as large as the ATT MTU the firmware asks for
+# (BUDDY_CHAT_ATT_MTU = 247 in main/buddy/buddy_ble.c).  They were left at the
+# Kconfig default of 64 while the ATT layer negotiated 247, so any ATT response
+# that did not fit in a single 64-byte fragment never came back: both ends sat
+# in the procedure until the ~30 s ATT timeout.  The tell-tale was that the same
+# read-by-type succeeded with a 44-byte response and failed with a 71-byte one.
+# 251 = 247 + 4 (L2CAP header), i.e. one full MTU-sized PDU per buffer.
+CONFIG_BT_NIMBLE_ACL_BUF_SIZE=251
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=251

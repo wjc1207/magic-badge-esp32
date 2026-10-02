@@ -808,11 +808,10 @@ static int cmd_buddy_status(int argc, char **argv)
             printf("\n--- Profile ---\n");
             printf("Name:   %s\n", profile->display_name);
             printf("Bio:    %s\n", profile->bio);
-            printf("Tags:   %s\n", profile->tags);
-            printf("Vibe:   %s\n", profile->vibe);
-            printf("OpenTo: %s\n", profile->open_to);
-            printf("Phone:  %s\n", profile->contact_phone[0] ? profile->contact_phone : "(not set)");
-            printf("Email:  %s\n", profile->contact_email[0] ? profile->contact_email : "(not set)");
+            printf("Look:   %s\n", profile->appearance[0] ? profile->appearance : "(not set)");
+            printf("Carry:  %s\n", profile->belongings[0] ? profile->belongings : "(not set)");
+            printf("Traits: %s\n", profile->traits[0] ? profile->traits : "(not set)");
+            printf("Tech:   %s\n", profile->tech_level[0] ? profile->tech_level : "(not set)");
             printf("Hash:   %02x%02x%02x%02x%02x%02x%02x%02x\n",
                    profile->profile_hash[0], profile->profile_hash[1],
                    profile->profile_hash[2], profile->profile_hash[3],
@@ -831,11 +830,10 @@ static int cmd_buddy_status(int argc, char **argv)
         buddy_contacts_list(recs, 10, &count);
         printf("\nContacts: %d\n", (int)count);
         for (size_t i = 0; i < count && i < 5; i++) {
-            printf("  %s - %s (met %lld, score=%.2f, synced=%s)\n",
+            printf("  %s - %s (met %lld, x%d)\n",
                    recs[i].peer_id, recs[i].display_name,
                    (long long)recs[i].last_met_unix,
-                   recs[i].match_score,
-                   recs[i].cloud_synced ? "yes" : "no");
+                   (int)recs[i].meeting_count);
         }
         if (count > 5) printf("  ...and %d more\n", (int)(count - 5));
         heap_caps_free(recs);

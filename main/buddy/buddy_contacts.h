@@ -26,10 +26,3 @@ esp_err_t buddy_contacts_list(buddy_contact_record_t *buf, size_t max, size_t *c
  * Check contact status: NEW, KNOWN, or RECENT (met within 24h).
  */
 buddy_contact_status_t buddy_contacts_check(const char *peer_id);
-
-/**
- * Update the cloud_synced fields of an existing contact record.
- */
-esp_err_t buddy_contacts_update_match(const char *peer_id, float score,
-                                      const char *icebreaker,
-                                      const char *shared_interests);

@@ -387,16 +387,16 @@ static esp_err_t http_get_config(httpd_req_t *req)
     if (bp_err == ESP_OK) {
         cJSON_AddStringToObject(root, "buddy_name", bp.display_name);
         cJSON_AddStringToObject(root, "buddy_bio", bp.bio);
-        cJSON_AddStringToObject(root, "buddy_tags", bp.tags);
-        cJSON_AddStringToObject(root, "buddy_vibe", bp.vibe);
-        cJSON_AddStringToObject(root, "buddy_open_to", bp.open_to);
-        cJSON_AddStringToObject(root, "buddy_phone", bp.contact_phone);
-        cJSON_AddStringToObject(root, "buddy_email", bp.contact_email);
+        cJSON_AddStringToObject(root, "buddy_appearance", bp.appearance);
+        cJSON_AddStringToObject(root, "buddy_belongings", bp.belongings);
+        cJSON_AddStringToObject(root, "buddy_traits", bp.traits);
+        cJSON_AddStringToObject(root, "buddy_tech_level", bp.tech_level);
     }
     cJSON_AddBoolToObject(root, "buddy_privacy",
                           buddy_privacy_get() == BUDDY_MODE_PRIVATE);
 
-    /* Buddy notification config */
+    /* Where the last conversation came from — the config page shows it, and it
+     * is also the destination every BLE-chat line is forwarded to. */
     {
         char value[128] = {0};
         nvs_handle_t nvs;
@@ -408,14 +408,6 @@ static esp_err_t http_get_config(httpd_req_t *req)
             len = sizeof(value); value[0] = '\0';
             if (nvs_get_str(nvs, MIMI_NVS_KEY_LAST_SRC_CHAT_ID, value, &len) == ESP_OK) {
                 cJSON_AddStringToObject(root, "last_src_chat_id", value);
-            }
-            len = sizeof(value); value[0] = '\0';
-            if (nvs_get_str(nvs, MIMI_NVS_KEY_BUDDY_NOTIFY_CHANNEL, value, &len) == ESP_OK) {
-                cJSON_AddStringToObject(root, "buddy_notify_channel", value);
-            }
-            len = sizeof(value); value[0] = '\0';
-            if (nvs_get_str(nvs, MIMI_NVS_KEY_BUDDY_NOTIFY_CHAT_ID, value, &len) == ESP_OK) {
-                cJSON_AddStringToObject(root, "buddy_notify_chat_id", value);
             }
             nvs_close(nvs);
         }
@@ -604,10 +596,6 @@ static esp_err_t http_post_save(httpd_req_t *req)
     nvs_sync_bool_field(root, "telegram_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_TELEGRAM_BOT);
     nvs_sync_bool_field(root, "feishu_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_FEISHU_BOT);
 
-    /* Buddy notification */
-    nvs_sync_field(root, "buddy_notify_channel", MIMI_NVS_FEATURE, MIMI_NVS_KEY_BUDDY_NOTIFY_CHANNEL);
-    nvs_sync_field(root, "buddy_notify_chat_id", MIMI_NVS_FEATURE, MIMI_NVS_KEY_BUDDY_NOTIFY_CHAT_ID);
-
     /* Buddy profile */
     {
         buddy_profile_t bp;
@@ -622,11 +610,10 @@ static esp_err_t http_post_save(httpd_req_t *req)
 
         SYNC_BUDDY_FIELD("buddy_name", bp.display_name, sizeof(bp.display_name));
         SYNC_BUDDY_FIELD("buddy_bio", bp.bio, sizeof(bp.bio));
-        SYNC_BUDDY_FIELD("buddy_tags", bp.tags, sizeof(bp.tags));
-        SYNC_BUDDY_FIELD("buddy_vibe", bp.vibe, sizeof(bp.vibe));
-        SYNC_BUDDY_FIELD("buddy_open_to", bp.open_to, sizeof(bp.open_to));
-        SYNC_BUDDY_FIELD("buddy_phone", bp.contact_phone, sizeof(bp.contact_phone));
-        SYNC_BUDDY_FIELD("buddy_email", bp.contact_email, sizeof(bp.contact_email));
+        SYNC_BUDDY_FIELD("buddy_appearance", bp.appearance, sizeof(bp.appearance));
+        SYNC_BUDDY_FIELD("buddy_belongings", bp.belongings, sizeof(bp.belongings));
+        SYNC_BUDDY_FIELD("buddy_traits", bp.traits, sizeof(bp.traits));
+        SYNC_BUDDY_FIELD("buddy_tech_level", bp.tech_level, sizeof(bp.tech_level));
 
         buddy_profile_set(&bp);
 

@@ -87,13 +87,18 @@ fail:
 }
 
 /* ── Compute beacon profile hash ──────────────────────────────── */
+/* The hash is what peers use to notice "this badge is not the one I met", so it
+ * has to cover the fields the owner can edit — including the character fields,
+ * otherwise rewriting how this person looks and behaves would leave the beacon
+ * advertising the old identity. */
 void buddy_profile_compute_hash(const buddy_profile_t *profile, uint8_t hash_out[8])
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "dn", profile->display_name);
-    cJSON_AddStringToObject(root, "tg", profile->tags);
-    cJSON_AddStringToObject(root, "vb", profile->vibe);
-    cJSON_AddStringToObject(root, "ot", profile->open_to);
+    cJSON_AddStringToObject(root, "ap", profile->appearance);
+    cJSON_AddStringToObject(root, "bl", profile->belongings);
+    cJSON_AddStringToObject(root, "tr", profile->traits);
+    cJSON_AddStringToObject(root, "tl", profile->tech_level);
 
     char *json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -165,9 +170,24 @@ static esp_err_t profile_load(void)
 
     size_t len = sizeof(*s_profile);
     err = nvs_get_blob(nvs, BUDDY_NVS_KEY_PROF, s_profile, &len);
+
     if (err == ESP_OK) {
-        buddy_profile_compute_hash(s_profile, s_profile->profile_hash);
-        ESP_LOGI(TAG, "Profile loaded: name=%s", s_profile->display_name);
+        /* The blob is a raw struct, so it is only meaningful if it was written
+         * by this exact layout.  An older blob is shorter, and the tail of the
+         * new struct would stay zero — which reads as "the owner emptied every
+         * field that did not exist when they saved", and would advertise an
+         * identity they never chose.  Reject it instead and let the caller fall
+         * back to defaults; the owner re-saves once from the config page. */
+        if (len != sizeof(*s_profile) || s_profile->version != BUDDY_PROFILE_VERSION) {
+            ESP_LOGW(TAG, "Stored profile is version/layout %u (%u bytes, expected %u) "
+                          "— ignoring it and using defaults",
+                     (unsigned)s_profile->version, (unsigned)len,
+                     (unsigned)sizeof(*s_profile));
+            err = ESP_ERR_INVALID_VERSION;
+        } else {
+            buddy_profile_compute_hash(s_profile, s_profile->profile_hash);
+            ESP_LOGI(TAG, "Profile loaded: name=%s", s_profile->display_name);
+        }
     }
 
     /* Privacy */
@@ -184,12 +204,11 @@ static esp_err_t profile_load(void)
 static void profile_set_default(buddy_profile_t *p)
 {
     memset(p, 0, sizeof(*p));
-    p->version = 1;
+    p->version = BUDDY_PROFILE_VERSION;
     snprintf(p->display_name, sizeof(p->display_name), "Buddy");
     snprintf(p->bio, sizeof(p->bio), "Exploring the world with Buddy.");
-    snprintf(p->tags, sizeof(p->tags), "[\"tech\",\"ai\",\"outdoors\"]");
-    snprintf(p->vibe, sizeof(p->vibe), "curious");
-    snprintf(p->open_to, sizeof(p->open_to), "[\"collab\",\"coffee\"]");
+    /* Left empty on purpose: these are personal, and the chat prompt simply
+     * omits whatever the owner has not filled in. */
     buddy_profile_compute_hash(p, p->profile_hash);
 }
 
@@ -214,7 +233,12 @@ esp_err_t buddy_profile_init(void)
 
     err = profile_load();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "No profile in NVS, using defaults");
+        if (err == ESP_ERR_INVALID_VERSION) {
+            ESP_LOGW(TAG, "Stored profile was written by an older layout — using "
+                          "defaults. Open the config page once and save to restore it.");
+        } else {
+            ESP_LOGW(TAG, "No profile in NVS, using defaults");
+        }
         profile_set_default(s_profile);
     }
 
@@ -233,6 +257,8 @@ esp_err_t buddy_profile_set(const buddy_profile_t *profile)
     if (!profile) return ESP_ERR_INVALID_ARG;
 
     memcpy(s_profile, profile, sizeof(*s_profile));
+    /* Whatever the caller handed over, what goes to NVS is this layout. */
+    s_profile->version = BUDDY_PROFILE_VERSION;
     buddy_profile_compute_hash(s_profile, s_profile->profile_hash);
 
     nvs_handle_t nvs;
