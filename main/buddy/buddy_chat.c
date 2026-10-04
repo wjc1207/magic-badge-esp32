@@ -1139,7 +1139,8 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
     }
 
     static const char *rule_block =
-        "Don't reuse a prop or topic already used; if one is exhausted, move on. \n";
+        "Don't reuse a prop or topic already used; if one is exhausted, move on. "
+        "Don't pretend to know something you don't know. \n";
 
     snprintf(ctx->system, MIMI_CONTEXT_BUF_SIZE,
         "You speak for %s. There is a person who wears a badge with"

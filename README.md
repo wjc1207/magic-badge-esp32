@@ -110,6 +110,43 @@ You can configure secrets in one of two ways:
 - Connect to this hotspot and visit `http://192.168.4.1`
 - Configure all secrets and settings in the web interface
 
+### 3. Add Your Character
+
+A badge talks as *you* — or as whichever character you put on it. The model needs
+to be told who that is, and the **Character** section of the web portal
+(`http://192.168.4.1`) is where you say so.
+
+Eight fields. Only the first two are broadcast to the other badge; the rest are
+local to your own model.
+
+| Field | Form label | Sent to the peer? | What it is for |
+|---|---|---|---|
+| `buddy_appearance` | Appearance | **yes** | what the other person can see |
+| `buddy_belongings` | Belongings | **yes** | what you are visibly carrying |
+| `buddy_traits` | Character (three words) | no | the temperament, as a few comma-separated words |
+| `buddy_speech` | How you speak | no | dialect, register, sentence length |
+| `buddy_tech_level` | World tech level | no | the setting, so modern objects do not leak in |
+| `buddy_knows` | What you know | no | the edge of the character's knowledge |
+| `buddy_bio` | Bio | no | background |
+| `buddy_name` | Display Name | no | learned by the peer only when you say it out loud |
+
+#### Method A: Fill the fields in by hand
+
+Type into the Character section and press **Save & Restart**. Fields are stored
+one per NVS key, so adding a field later never resets the ones you have already
+filled.
+
+#### Method B: Import a character card
+
+Character cards are plain JSON, so one can be authored in a text editor, kept in
+version control, or shared between badges.
+
+**Download** — press **Download** under *Character card (JSON)*. The current
+form values are saved as a file. The filename is the display name.
+
+**Upload** — press **Upload**, pick a `.json` file. The fields are filled in but
+**nothing is saved yet**: check the form, then press **Save & Restart**.
+
 ## two-layer configuration
 magic badge uses a two-layer configuration system, see [config.md](config.md) for details.
 
