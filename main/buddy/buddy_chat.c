@@ -45,6 +45,20 @@ static const char *TAG = "buddy_chat";
 #define CHAT_TYPE_BYE     "bye"
 
 #define CHAT_TEXT_MAX     160
+/* How many bytes of text the dialogue buffer holds, less the terminator.
+ *
+ * This is the number the model is actually held to, and it used to be wrong in a
+ * way that produced a cut-off line every single turn.  The prompt asked for "at
+ * most 152 characters" while the buffer kept 159 *bytes* — and one Chinese
+ * character is three bytes, so the real budget was about 53 characters.  The
+ * model aimed at 152, overshot the buffer by 3x, and libc's strncpy in
+ * llm_proxy.c sliced the sentence wherever byte 159 happened to land.
+ *
+ * The half sentence then went out over BLE and into s_voice, so the next turn's
+ * context contained it too.
+ *
+ * Byte-denominated on purpose: the constraint is the buffer, not the reader. */
+#define CHAT_MODEL_LIMIT  (CHAT_TEXT_MAX - 1)
 
 /* ── Session tuning ────────────────────────────────────────────── */
 #define CHAT_MAX_TURNS            6       /* frames per side, opening included */
@@ -68,6 +82,12 @@ static const char *TAG = "buddy_chat";
 /* Conversation window handed to the model.  Frames carry at most CHAT_TEXT_MAX
  * bytes each, so this covers the whole 6-turn session with room to spare. */
 #define CHAT_VOICE_MAX            1024
+/* The whole conversation, kept separately from s_voice for the owner's report.
+ *
+ * s_voice is truncated oldest-first because it feeds the model every turn; a
+ * report must not silently lose its opening, so this buffer is bigger and
+ * reports truncation instead. */
+#define CHAT_CONVO_MAX            2048
 
 /* The inference runs on its own task so the keep-alive pump keeps turning while
  * the network call is outstanding.  Its stack has to come from internal DRAM,
@@ -111,18 +131,103 @@ static char    s_last_peer_text[CHAT_PEER_TEXT_MAX];
  * becomes personal after one turn. */
 static char s_self_name[64];
 static char s_self_character[1024];    /* rendered profile lines, see below */
+static char s_peer_character[2048];    /* the other person, from their badge */
 static char s_peer_name[64];
 static char s_voice[CHAT_VOICE_MAX];   /* "them: ...\nme: ...\n" so far */
+
+/* The full dialogue, PSRAM, for the single message sent when the session ends.
+ * NULL when no session is running. */
+static char *s_conversation;
+static bool  s_conversation_truncated;   /* longest-line cache of the flag */
 
 /* Who was on the other badge during the session that just ran.  buddy_ble_peer_id()
  * goes empty the moment the link is torn down, and the closing summary is pushed
  * after that point, so the id has to outlive the link. */
 static char s_session_peer[18];
 
+/* Declared here, above the reporting helpers that need it: it is defined much
+ * further down with the prompt builder, and the report buffers cut lines at a
+ * character boundary so a truncated line never ends mid-codepoint. */
+static size_t chat_utf8_limit(const char *s, size_t max);
+
+/* How many Chinese characters fit in `bytes`, rounded down.  Used only to put a
+ * size the model can reason about next to a byte count: it has no notion of
+ * UTF-8 width, so "152" reads as 152 characters and it writes three times the
+ * line that fits. */
+static int chat_bytes_to_cjk(size_t bytes)
+{
+    int n = (int)(bytes / 3);
+    return n > 0 ? n : 1;
+}
+
+/* True when `text` was cut off by the reply buffer rather than ended by the
+ * model.  A reply that exactly fills every byte available is the signature of
+ * the copy in extract_text_openai() having stopped at the limit; real prose
+ * essentially never lands there, and mistaking a genuine full line for a clipped
+ * one only costs a redundant rewrite. */
+static bool chat_reply_was_clipped(const char *text, size_t buf_size)
+{
+    return text && strlen(text) + 1 >= buf_size;
+}
+
+/* Drop a trailing incomplete clause, so a line that has to be shortened still
+ * ends somewhere a person would.  Falls back to the first sentence when there is
+ * no clause break to cut at; returns the original when there is no punctuation
+ * at all, leaving the caller to decide. */
+static size_t chat_trim_to_break(char *text, size_t len)
+{
+    static const char *breaks[] = { "。", "！", "？", "；", "…", "，", ",", ".", ";", "!", "?" };
+
+    if (len == 0) return 0;
+
+    /* Prefer the last sentence end, then the last clause break. */
+    for (size_t b = 0; b < sizeof(breaks) / sizeof(breaks[0]); b++) {
+        size_t bl = strlen(breaks[b]);
+        if (len <= bl) continue;
+
+        /* Walk back from the end looking for this break. */
+        for (size_t i = len - bl + 1; i > 0; i--) {
+            size_t at = i - 1;
+            if (memcmp(text + at, breaks[b], bl) == 0) {
+                size_t cut = at + bl;
+                /* Everything before the break must be more than a crumb. */
+                if (cut >= 6) return cut;
+                break;
+            }
+        }
+    }
+    return len;
+}
+
+/* Reshape an over-long reply: first ask for a rewrite, then fall back to cutting
+ * at a punctuation boundary.  Never returns a line longer than `limit`, and
+ * never cuts mid-sentence unless there is no punctuation to cut at. */
+static void chat_fit_reply(char *text, size_t size, size_t limit)
+{
+    size_t len = strlen(text);
+    if (len <= limit) return;
+
+    size_t cut = chat_trim_to_break(text, limit);
+    if (cut > limit) cut = limit;
+
+    /* Back off to a character boundary. */
+    while (cut > 0 && ((unsigned char)text[cut] & 0xC0) == 0x80) cut--;
+    text[cut] = '\0';
+
+    ESP_LOGW(TAG, "Reply was %u bytes and had to be cut to %u at a clause break",
+             (unsigned)len, (unsigned)cut);
+}
+
 /* ── Cross-channel reporting ─────────────────────────────────────
  * A BLE encounter is invisible to the owner's phone unless something pushes it
- * there, so every turn is forwarded as it happens and the session closes with a
- * summary.
+ * there, so the session ends with TWO messages: the dialogue in full, then a
+ * written summary.
+ *
+ * It used to push every turn as it happened, which buried the owner's channel
+ * under a dozen notifications per encounter — one per line, plus a keep-alive
+ * every 800 ms while the model was thinking, plus the summary.  Batching the
+ * dialogue into one message at the end keeps the same information at a
+ * fraction of the noise.
  *
  * The destination is whatever channel the owner last spoke to the agent on —
  * the same "last source" the agent loop already records in NVS — rather than a
@@ -201,6 +306,57 @@ static void chat_notify_owner(const char *body)
     chat_notify(channel, chat_id, body);
 }
 
+/* ── Full-dialogue buffer ────────────────────────────────────────
+ * Kept apart from s_voice on purpose: s_voice truncates oldest-first because it
+ * is re-sent to the model every turn, and that is the wrong trade for the copy
+ * the owner reads once.
+ *
+ * Lifetime: reset at the start of a session, filled a line at a time as the
+ * session runs, and handed to the report writer when it ends. */
+
+static void chat_conversation_reset(void)
+{
+    if (!s_conversation) {
+        s_conversation = heap_caps_calloc(1, CHAT_CONVO_MAX, MALLOC_CAP_SPIRAM);
+        if (!s_conversation) {
+            ESP_LOGW(TAG, "No buffer for the encounter transcript");
+            return;
+        }
+    }
+    s_conversation[0] = '\0';
+    s_conversation_truncated = false;
+}
+
+/* One line of dialogue, from the owner's side or the peer's. */
+static void chat_conversation_append(const char *who, const char *text)
+{
+    if (!s_conversation || !text || !text[0]) return;
+
+    size_t used = strlen(s_conversation);
+    size_t room = CHAT_CONVO_MAX - 1 - used;
+    if (room < 8) {
+        /* Say so rather than dropping lines silently: a report that quietly
+         * stops halfway is worse than one that admits it was cut. */
+        if (!s_conversation_truncated) {
+            s_conversation_truncated = true;
+            ESP_LOGW(TAG, "Encounter transcript exceeded %d bytes; later turns dropped",
+                     CHAT_CONVO_MAX);
+        }
+        return;
+    }
+
+    char line[CHAT_TEXT_MAX + 32];
+    int n = snprintf(line, sizeof(line), "%s：%s\n", who, text);
+    if (n < 0) return;
+
+    size_t want = chat_utf8_limit(line, sizeof(line) - 1);
+    if (want > room) want = chat_utf8_limit(line, room);
+    if (want == 0) return;
+
+    memcpy(s_conversation + used, line, want);
+    s_conversation[used + want] = '\0';
+}
+
 static int64_t chat_now_ms(void)
 {
     return esp_timer_get_time() / 1000LL;
@@ -212,22 +368,22 @@ static const char *chat_self_tag(void);
 /* Defined with the encounter-report writer below; called when a session ends. */
 static void chat_summary_start(void);
 
+/* Also defined below: clears the buffer that accumulates the dialogue.  The
+ * closing messages themselves are built and sent by chat_summary_start(). */
+static void chat_conversation_reset(void);
+
 /* Defined below the composer; used by the worker to reject diagnostics. */
 static bool chat_reply_is_error(const char *reply);
 
-/* Our own display name, from the profile that also feeds the beacon.  Read once
- * per session: buddy_profile_get() hands back the whole struct. */
+/* Our own display name.  The profile is stored per field in NVS, so this is one
+ * key read — still cached for the session, since the prompt is rebuilt every
+ * turn and the config page can change it between encounters. */
 static const char *chat_self_name(void)
 {
     if (s_self_name[0]) return s_self_name;
 
-    buddy_profile_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
-    if (p) {
-        if (buddy_profile_get(p) == ESP_OK && p->display_name[0]) {
-            snprintf(s_self_name, sizeof(s_self_name), "%s", p->display_name);
-        }
-        heap_caps_free(p);
-    }
+    buddy_profile_get_field(BUDDY_PROF_KEY_NAME, s_self_name, sizeof(s_self_name));
+
     if (!s_self_name[0]) {
         snprintf(s_self_name, sizeof(s_self_name), "Badge %s", chat_self_tag());
     }
@@ -311,34 +467,124 @@ static const char *chat_self_character(void)
 {
     if (s_self_character[0]) return s_self_character;
 
-    buddy_profile_t *p = heap_caps_calloc(1, sizeof(*p), MALLOC_CAP_SPIRAM);
-    if (!p) return "";
+    /* One NVS read per field, straight into a local buffer — no need to
+     * materialise the whole profile for six keys.  Each field is bounded by a
+     * byte count (the web form caps them there too), so one can end
+     * mid-character; chat_utf8_limit() trims to a boundary before it goes into
+     * the prompt that becomes a JSON request body. */
+    struct {
+        const char *label;
+        const char *key;
+    } fields[] = {
+        { "How you look",      BUDDY_PROF_KEY_APPEARANCE },
+        { "What you carry",    BUDDY_PROF_KEY_BELONGINGS },
+        { "Your character",    BUDDY_PROF_KEY_TRAITS     },
+        { "How you speak",     BUDDY_PROF_KEY_SPEECH     },
+        { "World tech level",  BUDDY_PROF_KEY_TECH_LEVEL },
+        { "About you",         BUDDY_PROF_KEY_BIO        },
+    };
+    const size_t count = sizeof(fields) / sizeof(fields[0]);
 
-    if (buddy_profile_get(p) == ESP_OK) {
+    /* One scratch buffer large enough for the biggest field, reused per read. */
+    char *scratch = heap_caps_calloc(1, BUDDY_BIO_LEN, MALLOC_CAP_SPIRAM);
+    if (!scratch) return "";
+
+    size_t off = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (buddy_profile_get_field(fields[i].key, scratch, BUDDY_BIO_LEN) != ESP_OK) continue;
+        if (!scratch[0]) continue;
+
+        size_t safe = chat_utf8_limit(scratch, strlen(scratch));
+        off = chat_append_line(s_self_character, off, sizeof(s_self_character),
+                               "%s: %.*s\n", fields[i].label, (int)safe, scratch);
+    }
+
+    /* The knowledge boundary is rendered on its own, after everything else, and
+     * with the boundary sentence attached.
+     *
+     * The sentence is fixed here rather than left to the wearer on purpose: it
+     * is what makes the field a filter instead of a list of things to mention.
+     * A field that reads as facts ("knows: 璃月、神之眼") invites the model to
+     * recite them; the same field plus "anything else, you have never heard of"
+     * turns a stranger's unfamiliar belongings into a question.  Every wearer
+     * gets the same behaviour, and nobody has to phrase it.
+     *
+     * Absent when unfilled, like every other field — the rule on its own would
+     * make the character deny knowing their own setting. */
+    if (buddy_profile_get_field(BUDDY_PROF_KEY_KNOWS, scratch, BUDDY_BIO_LEN) == ESP_OK &&
+        scratch[0]) {
+        size_t safe = chat_utf8_limit(scratch, strlen(scratch));
+        off = chat_append_line(s_self_character, off, sizeof(s_self_character),
+                               "What you know: %.*s\n", (int)safe, scratch);
+        off = chat_append_line(s_self_character, off, sizeof(s_self_character),
+                               "Anything outside that list you have never heard of: you "
+                               "do not recognise it, cannot name it, and ask about it "
+                               "instead of pretending to understand.\n");
+    }
+
+    /* A truncated profile reads as a character with missing traits and a missing
+     * history, which looks like a modelling failure rather than a full buffer.
+     * The fields are all long-form, so this is reachable; say so once. */
+    if (off + 1 >= sizeof(s_self_character)) {
+        ESP_LOGW(TAG, "Character block filled its %u-byte buffer; later lines dropped",
+                 (unsigned)sizeof(s_self_character));
+    }
+
+    heap_caps_free(scratch);
+    return s_self_character;
+}
+
+/* The person on the other badge, as far as the profile exchange revealed them.
+ *
+ * This is the half that has to arrive over the air: our own character material
+ * comes from our own NVS, but what the *other* person looks like and carries can
+ * only be learned from their badge.  It is what lets a reply be about them —
+ * "that sword looks heavier than you do" — instead of a generic exchange.
+ *
+ * Traits, how the wearer speaks, and their world's tech level are deliberately
+ * not sent by the peer (they are local to how each badge talks), so they are
+ * absent here too. */
+/* What the other badge revealed about its wearer: how they look and what they
+ * carry, and nothing else.
+ *
+ * Name and history are deliberately absent.  Standing in front of someone you
+ * can see what they are wearing and holding; you do not know their name or where
+ * they come from until they tell you — that is what the conversation is for, and
+ * it is why the opening line introduces the wearer by name even though neither
+ * badge transmits one. */
+static const char *chat_peer_character(void)
+{
+    if (s_peer_character[0]) return s_peer_character;
+
+    char *appearance = heap_caps_calloc(1, BUDDY_APPEARANCE_LEN, MALLOC_CAP_SPIRAM);
+    char *belongings = heap_caps_calloc(1, BUDDY_BELONGINGS_LEN, MALLOC_CAP_SPIRAM);
+    if (!appearance || !belongings) {
+        heap_caps_free(appearance);
+        heap_caps_free(belongings);
+        return "";
+    }
+
+    if (buddy_ble_peer_profile(appearance, BUDDY_APPEARANCE_LEN,
+                               belongings, BUDDY_BELONGINGS_LEN)) {
         size_t off = 0;
-        const size_t size = sizeof(s_self_character);
+        const size_t size = sizeof(s_peer_character);
 
-        /* Each field is bounded by a byte count (the web form caps them there
-         * too), so one can end mid-character; trim to a boundary before it goes
-         * into the prompt that becomes a JSON request body. */
         struct { const char *label; const char *value; } lines[] = {
-            { "How you look",     p->appearance },
-            { "What you carry",   p->belongings },
-            { "Your character",   p->traits },
-            { "Your tech comfort", p->tech_level },
-            { "About you",        p->bio },
+            { "How they look",    appearance },
+            { "What they carry",  belongings },
         };
 
         for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
             if (!lines[i].value[0]) continue;
             size_t safe = chat_utf8_limit(lines[i].value, strlen(lines[i].value));
-            off = chat_append_line(s_self_character, off, size, "%s: %.*s\n",
+            off = chat_append_line(s_peer_character, off, size, "%s: %.*s\n",
                                    lines[i].label, (int)safe, lines[i].value);
         }
     }
 
-    heap_caps_free(p);
-    return s_self_character;
+    heap_caps_free(appearance);
+    heap_caps_free(belongings);
+    return s_peer_character;
 }
 
 /* Short local tag so both ends can be told apart in a transcript: the last
@@ -492,13 +738,9 @@ static bool chat_send(const char *type, const char *text)
             (strcmp(type, CHAT_TYPE_HELLO) == 0 || strcmp(type, CHAT_TYPE_MSG) == 0)) {
             chat_voice_append("me", text);
 
-            /* Forward the turn as it happens, so the owner can follow along
-             * live.  Only real turns: `busy` frames would push once every
-             * 800 ms while the model thinks. */
-            char line[CHAT_TEXT_MAX + 48];
-            snprintf(line, sizeof(line), "【我 → %s】%s",
-                     s_peer_name[0] ? s_peer_name : "对方", text);
-            chat_notify_owner(line);
+            /* Kept for the single message sent when the session ends.  It used
+             * to be pushed here, one notification per turn. */
+            chat_conversation_append("我", text);
         }
     } else {
         ESP_LOGW(TAG, "Send '%s' failed: %s", type, esp_err_to_name(err));
@@ -550,6 +792,12 @@ typedef struct {
     char            system[MIMI_CONTEXT_BUF_SIZE];
     char            user[CHAT_VOICE_MAX + CHAT_TEXT_MAX + 64];
     char            reply[CHAT_TEXT_MAX];
+    /* Bytes of `reply` a line may occupy.  Separate from sizeof(reply) because
+     * the prompt has to quote it and the check has to compare against it. */
+    size_t          reply_limit;
+    /* When this turn's inference started, so the worker can tell whether a
+     * second round-trip still fits the budget before spending it. */
+    int64_t         turn_started_ms;
     bool            ok;
     /* At most one worker may run at a time: it is what makes the single static
      * context below safe, and it stops a timed-out worker from being overwritten
@@ -686,6 +934,77 @@ static void chat_llm_task(void *arg)
         vTaskDelete(NULL);
     }
 
+    /* Too long, or clipped by the reply buffer.  Ask once for a shorter version
+     * rather than let a half sentence go out — and rather than let it into
+     * s_voice, where it would sit in the context of every later turn.
+     *
+     * The retry spends a second round-trip, so it is deliberately the only one:
+     * a model that overshoots twice gets cut at a clause break instead, which is
+     * still better than mid-word.  It is also skipped outright when the turn has
+     * already used most of its budget — being cut short beats being late, and a
+     * late turn is discarded entirely. */
+    bool can_afford_retry =
+        (chat_now_ms() - ctx->turn_started_ms) < (CHAT_THINK_BUDGET_MS * 2 / 3);
+
+    if (ctx->reply[0] && can_afford_retry &&
+        (strlen(ctx->reply) > ctx->reply_limit ||
+         chat_reply_was_clipped(ctx->reply, sizeof(ctx->reply)))) {
+        size_t was = strlen(ctx->reply);
+        char *retry = heap_caps_malloc(sizeof(ctx->reply), MALLOC_CAP_SPIRAM);
+
+        if (retry) {
+            snprintf(retry, sizeof(ctx->reply), "%s", ctx->reply);
+
+            cJSON *msgs = cJSON_CreateArray();
+            cJSON *u1 = msgs ? cJSON_CreateObject() : NULL;
+            cJSON *a1 = msgs ? cJSON_CreateObject() : NULL;
+            cJSON *u2 = msgs ? cJSON_CreateObject() : NULL;
+            char ask[256];
+
+            snprintf(ask, sizeof(ask),
+                     "Rewrite your last line so it ends at a sentence boundary and "
+                     "fits in %u bytes of UTF-8 — about %d Chinese characters. Keep "
+                     "the same meaning and the same language. Output only the shorter "
+                     "line.",
+                     (unsigned)ctx->reply_limit,
+                     chat_bytes_to_cjk(ctx->reply_limit));
+
+            if (u1 && a1 && u2) {
+                cJSON_AddStringToObject(u1, "role", "user");
+                cJSON_AddStringToObject(u1, "content", ctx->user);
+                cJSON_AddStringToObject(a1, "role", "assistant");
+                cJSON_AddStringToObject(a1, "content", retry);
+                cJSON_AddStringToObject(u2, "role", "user");
+                cJSON_AddStringToObject(u2, "content", ask);
+                cJSON_AddItemToArray(msgs, u1);
+                cJSON_AddItemToArray(msgs, a1);
+                cJSON_AddItemToArray(msgs, u2);
+
+                char *json = cJSON_PrintUnformatted(msgs);
+                if (json) {
+                    esp_err_t err = llm_chat(ctx->system, json,
+                                             ctx->reply, sizeof(ctx->reply));
+                    if (err == ESP_OK && ctx->reply[0] &&
+                        !chat_reply_is_error(ctx->reply)) {
+                        ESP_LOGI(TAG, "Shortened an over-long reply: %u -> %u bytes",
+                                 (unsigned)was, (unsigned)strlen(ctx->reply));
+                    } else {
+                        /* Keep the first attempt; it is no worse, and it is
+                         * about to be cut at a clause break below. */
+                        snprintf(ctx->reply, sizeof(ctx->reply), "%s", retry);
+                    }
+                    free(json);
+                }
+            }
+
+            cJSON_Delete(msgs);
+            heap_caps_free(retry);
+        }
+    }
+
+    /* Last resort for anything still too long: end it where a person would. */
+    chat_fit_reply(ctx->reply, sizeof(ctx->reply), ctx->reply_limit);
+
     chat_llm_canned(ctx);
     ctx->ok = true;
 
@@ -741,6 +1060,12 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
         return false;
     }
 
+    /* The prompt quotes this and the length check enforces it, so it has to be
+     * set before either runs.  Clamped to the buffer: a limit larger than the
+     * array would let the model write text that llm_proxy.c then clips. */
+    ctx->reply_limit = (size - 1 < CHAT_MODEL_LIMIT) ? size - 1 : CHAT_MODEL_LIMIT;
+    ctx->turn_started_ms = chat_now_ms();
+
     /* A worker from a previous turn may still be inside llm_chat() — its
      * inference outlived the turn that started it.  Its reply belongs to a
      * session that is over, so take a canned line for this turn rather than
@@ -763,64 +1088,80 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
     snprintf(ctx->peer_text, sizeof(ctx->peer_text), "%s",
              peer_text ? peer_text : "");
 
-    /* The peer's name is worth having before the first reply: a badge met in an
-     * earlier encounter is already in the contact store. */
-    if (!s_peer_name[0] && buddy_ble_peer_id()[0]) {
-        buddy_contact_record_t *rec = heap_caps_calloc(1, sizeof(*rec), MALLOC_CAP_SPIRAM);
-        if (rec) {
-            if (buddy_contacts_get(buddy_ble_peer_id(), rec) == ESP_OK) {
-                snprintf(s_peer_name, sizeof(s_peer_name), "%s", rec->display_name);
-            }
-            heap_caps_free(rec);
+    /* Nothing pre-fills the peer's name: neither badge transmits one, and a
+     * contact record only holds what was visible at the time.  The name arrives
+     * when the person says it, which chat_note_peer_name() picks up. */
+
+    /* One prompt, three pieces of wording that actually differ.
+     *
+     * This used to be two whole snprintf() literals that repeated their shared
+     * paragraphs verbatim, so every edit had to be made twice and the two copies
+     * had already drifted apart (one had grown "with character", the other had
+     * not).  Splitting the shared text out is the only way the two variants stay
+     * honest about what they have in common. */
+    static const char k_peer_block[] =
+        "The person in front of you, as their badge described them:\n";
+    /* The language rule lives here rather than in either task block because both
+     * turns need it and it is the same rule: match the other person when there is
+     * something to match, and otherwise write in the character's own language.
+     * Its "if they have not spoken yet" half is what covers the opening turn. */
+    static const char k_size_block[] =
+        "No preamble, no emoji, no quotes.\n"
+        "in the language of Chinese";
+
+    const char *task_block;
+    const char *peer_block;
+    /* Rendered as ", talking to 嘉明" — empty until they have said their name,
+     * because neither badge transmits one and the prompt must not invent it.
+     * Sized so the compiler can prove it holds the worst case: 13 bytes of
+     * literal, a full s_peer_name (63), and the terminator is 77, so 80 fits —
+     * and -Werror=format-truncation checks exactly that. */
+    char talking_to[80] = "";
+
+    if (my_turns == 0) {
+        task_block =
+            "This is the opening line of a face-to-face chat in the street. Greet "
+            "someone you have never met and say who you are.\n";
+        /* The peer's visible half is available before the first word is spoken:
+         * buddy_ble.c stores it when the profile exchange completes, which is
+         * what opens the chat link in the first place.  Standing in front of
+         * somebody you can see what they are wearing and carrying, so the
+         * opening line may act on it — the same block the later turns get.*/
+        peer_block = chat_peer_character()[0] ? k_peer_block : "";
+    } else {
+        task_block =
+            "The other person you have never met has spoken. React to what they just said.\n";
+        peer_block = chat_peer_character()[0] ? k_peer_block : "";
+        /* The name is only known once they have said it. */
+        if (s_peer_name[0]) {
+            snprintf(talking_to, sizeof(talking_to), ", talking to %s", s_peer_name);
         }
     }
 
-    if (my_turns == 0) {
-        snprintf(ctx->system, MIMI_CONTEXT_BUF_SIZE,
-            "You speak for %s. They are a real person wearing a magic badge on a "
-            "lanyard; the badge is only how their voice travels, and the badge now "
-            "within range carries somebody else the same way.\n"
-            "You are %s: not an assistant, not a device, and never introduced as one "
-            "— every line must be something this person would actually say out loud "
-            "to a stranger standing in front of them. Do not mention badges, BLE, "
-            "AI, models, prompts or this setup; the other side never hears about it.\n"
-            "%s"
-            "\n"
-            "Speak in this person's own voice — their way of noticing things, their "
-            "level of technical comfort, what they happen to be carrying. Do not "
-            "recite these notes; let them shape how you talk.\n"
-            "This is the opening line of a face-to-face chat in the street. Say who "
-            "you are, then ask one short question that invites the other person to "
-            "say who they are and what they are into.\n"
-            "There is nothing from them yet, so there is no language to match: write "
-            "this opening line in Chinese.\n"
-            "One sentence, at most %d characters. No preamble, no emoji, no quotes, "
-            "and no full stop listing of your traits.",
-            chat_self_name(), chat_self_name(), chat_self_character(),
-            CHAT_TEXT_MAX - 8);
-    } else {
-        snprintf(ctx->system, MIMI_CONTEXT_BUF_SIZE,
-            "You speak for %s. They are a real person wearing a magic badge on a "
-            "lanyard; the badge is only how their voice travels, and the badge now "
-            "within range carries somebody else the same way.\n"
-            "You are %s, talking to %s. Not an assistant, not a device, and never "
-            "introduced as one — every line must be something this person would "
-            "actually say out loud. Do not mention badges, BLE, AI, models, prompts "
-            "or this setup.\n"
-            "%s"
-            "\n"
-            "Speak in this person's own voice — their way of noticing things, their "
-            "level of technical comfort, what they happen to be carrying. Do not "
-            "recite these notes; let them shape how you talk.\n"
-            "The chat is already open. React to what they just said and ask at most "
-            "one short follow-up question; a light joke is fine if it fits.\n"
-            "One sentence, at most %d characters, in the same language they wrote in. "
-            "No preamble, no emoji, no quotes.",
-            chat_self_name(), chat_self_name(),
-            s_peer_name[0] ? s_peer_name : "the person on the other badge",
-            chat_self_character(),
-            CHAT_TEXT_MAX - 8);
-    }
+    static const char *rule_block =
+        "Don't reuse a prop or topic already used; if one is exhausted, move on. \n";
+
+    snprintf(ctx->system, MIMI_CONTEXT_BUF_SIZE,
+        "You speak for %s. There is a person who wears a badge with"
+        "this character; there is other person who wears a different badge with a different character."
+        "Two badges are in the range that allow them to communicate.\n"
+        "You are %s%s: not an assistant, not a device, and never introduced as one. "
+        "Do not mention badges, BLE, AI, models, prompts or this setup.\n"
+        "%s"
+        "\n"
+        "Speak in this person's own voice — their way of speaking. "
+        "Do not recite these notes; let them shape how you talk.\n"
+        "%s"
+        "%s"
+        "%s"
+        "At most %d bytes in UTF-8 — about %d Chinese characters. %s",
+        chat_self_name(), chat_self_name(), talking_to,
+        chat_self_character(),
+        peer_block,
+        task_block,
+        rule_block,
+        CHAT_MODEL_LIMIT - 1, chat_bytes_to_cjk(CHAT_MODEL_LIMIT - 1),
+        k_size_block);
 
     snprintf(ctx->user, CHAT_VOICE_MAX + CHAT_TEXT_MAX + 64,
              "Conversation so far:\n%s\nLatest line from them:\n%s",
@@ -891,16 +1232,24 @@ static bool chat_reply_is_error(const char *reply)
 /* ── Encounter report ──────────────────────────────────────────────
  * The session's closing message is written by the model, not stitched together
  * from the transcript: what the owner wants is who they met and what came of it,
- * not a replay of a conversation they can already read line by line as it
- * happened.
+ * not a replay of a conversation they can already read.
+ *
+ * The report writer owns BOTH closing messages.  It sends the written report
+ * first and the full dialogue second, because the two would otherwise race for
+ * the single HTTP lock: the session task queued the dialogue and then
+ * immediately started the report's inference, the inference held the lock for
+ * its whole round-trip (~20 s), and the dialogue send gave up after the lock's
+ * own 10 s timeout and was dropped.  Serialising them inside this one task
+ * removes the race without a sleep and without a second lock.
  *
  * The inference runs on a detached one-shot task.  It cannot run on the session
  * task, because that task is about to tear the BLE link down and the model takes
  * seconds; and a task function may not return, so the worker deletes itself once
- * it has pushed the report. */
+ * it has pushed both messages. */
 typedef struct {
     char *transcript;   /* owned by the worker */
     char *who;          /* owned by the worker */
+    char *dialogue;     /* owned by the worker; sent first, may be NULL */
     int   turns;
     int   seconds;
 } chat_summary_t;
@@ -956,9 +1305,25 @@ static void chat_summary_task(void *arg)
         ESP_LOGW(TAG, "No memory for the encounter report");
     }
 
+    /* The full dialogue goes out AFTER the report, not before.
+     *
+     * Both messages need the one global HTTP lock, whose take-timeout is 10 s,
+     * while this task's inference holds it for the whole round-trip (~20 s in
+     * the first field test).  Queueing the dialogue up front left the two
+     * racing, and the dialogue lost: it was dropped with "HTTP lock timeout"
+     * and only the report arrived.
+     *
+     * Sending it here means the inference has already finished and released the
+     * lock, so the two sends cannot overlap at all.  The owner reads these
+     * asynchronously, so report-then-dialogue is no worse than the other order. */
+    if (job->dialogue && job->dialogue[0]) {
+        chat_notify_owner(job->dialogue);
+    }
+
     heap_caps_free(system);
     heap_caps_free(user);
     heap_caps_free(reply);
+    heap_caps_free(job->dialogue);
     heap_caps_free(job->transcript);
     heap_caps_free(job->who);
 
@@ -966,25 +1331,43 @@ static void chat_summary_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* Hand the encounter to the report writer.  Returns immediately: the session
- * must not wait for a cloud round-trip before dropping the link. */
+/* Hand the encounter to the report writer, which sends the written report and
+ * then the full dialogue.  Returns immediately: the session must not wait for a
+ * cloud round-trip before dropping the link.
+ *
+ * Takes over s_conversation rather than copying it; the buffer is allocated
+ * fresh by chat_conversation_reset() for each session, so handing the pointer
+ * over is cheaper than duplicating up to CHAT_CONVO_MAX bytes. */
 static void chat_summary_start(void)
 {
     chat_summary_t *job = heap_caps_calloc(1, sizeof(*job), MALLOC_CAP_SPIRAM);
     if (!job) return;
 
+    const char *who = s_peer_name[0] ? s_peer_name : s_session_peer;
+
     job->transcript = heap_caps_malloc(strlen(s_voice) + 1, MALLOC_CAP_SPIRAM);
-    job->who        = heap_caps_malloc(strlen(s_peer_name[0] ? s_peer_name
-                                                             : s_session_peer) + 1,
-                                       MALLOC_CAP_SPIRAM);
+    job->who        = heap_caps_malloc(strlen(who) + 1, MALLOC_CAP_SPIRAM);
+    if (s_conversation && s_conversation[0]) {
+        size_t size = CHAT_CONVO_MAX + 96;
+        job->dialogue = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+        if (job->dialogue) {
+            snprintf(job->dialogue, size, "【本次相遇·完整对话】\n对象：%s\n\n%s",
+                     who[0] ? who : "对方", s_conversation);
+        }
+    }
     if (!job->transcript || !job->who) {
         heap_caps_free(job->transcript);
         heap_caps_free(job->who);
+        heap_caps_free(job->dialogue);
         heap_caps_free(job);
         return;
     }
     strcpy(job->transcript, s_voice);
-    strcpy(job->who, s_peer_name[0] ? s_peer_name : s_session_peer);
+    strcpy(job->who, who);
+
+    /* The job owns the text now.  Clearing the source means a second call — or
+     * anything that reads it before the next reset — cannot send it twice. */
+    if (s_conversation) s_conversation[0] = '\0';
 
     job->turns   = s_my_turns + s_peer_turns;
     job->seconds = (int)((chat_now_ms() - s_session_start_ms) / 1000);
@@ -992,7 +1375,9 @@ static void chat_summary_start(void)
     if (xTaskCreate(chat_summary_task, "buddy_sum", chat_llm_pick_stack(),
                     job, CHAT_LLM_TASK_PRIO, NULL) != pdPASS) {
         ESP_LOGW(TAG, "No task for the encounter report; sending the transcript instead");
+        if (job->dialogue) chat_notify_owner(job->dialogue);
         chat_notify_owner(job->transcript);
+        heap_caps_free(job->dialogue);
         heap_caps_free(job->transcript);
         heap_caps_free(job->who);
         heap_caps_free(job);
@@ -1112,11 +1497,11 @@ static bool chat_wait_turn(void)
             chat_voice_append("them", frame.text);
             s_peer_turns++;
 
-            /* Their turn, forwarded the moment it arrives. */
-            char line[CHAT_PEER_TEXT_MAX + 48];
-            snprintf(line, sizeof(line), "【%s → 我】%s",
-                     s_peer_name[0] ? s_peer_name : "对方", frame.text);
-            chat_notify_owner(line);
+            /* Kept for the end-of-session message.  The label is fixed at
+             * 对方 rather than the peer's name, because the name is only
+             * learned partway through and a report that changes what it calls
+             * the same person halfway down reads as two different people. */
+            chat_conversation_append("对方", frame.text);
             return true;
         }
 
@@ -1193,11 +1578,18 @@ static void chat_run_session(void)
      * usually the reason a new session exists at all.
      *
      * Clearing the cached self-description too means an edit made in the config
-     * page is picked up by the next encounter, without a reboot. */
+     * page is picked up by the next encounter, without a reboot.
+     *
+     * s_peer_character is cleared for the same reason: it is filled from the
+     * profile exchange of *this* link, and must never describe the last one. */
     s_voice[0] = '\0';
     s_peer_name[0] = '\0';
+    s_peer_character[0] = '\0';
     s_self_name[0] = '\0';
     s_self_character[0] = '\0';
+
+    /* And the copy kept for the owner's report. */
+    chat_conversation_reset();
 
     buddy_led_set(BUDDY_LED_PATTERN_CHAT);
     ESP_LOGI(TAG, "Session with %s started (role=%s, payload max %u B)",
@@ -1222,15 +1614,27 @@ static void chat_run_session(void)
     ESP_LOGI(TAG, "Session with %s ended (%d sent, %d received)",
              buddy_ble_peer_id(), s_my_turns, s_peer_turns);
 
-    /* Close the encounter in the owner's channel with a written report.  Started,
-     * not awaited: the report needs a cloud round-trip, and the link has to come
-     * down now.  It reads the session state (transcript, name, counters), so it
-     * has to be launched before the link teardown below clears any of it. */
+    /* Two messages close the encounter in the owner's channel: a written report,
+     * then the dialogue in full.  Both are handed to the report writer, which
+     * serialises them — see the comment on chat_summary_t for why that has to
+     * happen there and not here.
+     *
+     * The job is started, not awaited: the report needs a cloud round-trip and
+     * the link has to come down now.  It reads session state (transcript, name,
+     * counters), so it has to be built before the teardown below clears any of
+     * it. */
     if (s_my_turns > 0 || s_peer_turns > 0) {
         chat_summary_start();
     }
 
     buddy_led_set(BUDDY_LED_PATTERN_OFF);
+
+    /* Start the cool-down *before* dropping the link: both badges are advertising
+     * and scanning again within milliseconds of the disconnect, and without this
+     * they immediately find each other and talk another round.  Recorded against
+     * the peer's device id while the link is still up, since that is how the
+     * scan-side gate knows which peer this was. */
+    buddy_ble_note_round_complete(buddy_ble_peer_id());
 
     /* Drop the link so both badges go back to scanning for the next encounter. */
     buddy_ble_terminate_link();

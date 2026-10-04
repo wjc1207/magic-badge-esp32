@@ -19,13 +19,14 @@
 static const char *TAG = "buddy_profile";
 
 static buddy_identity_t *s_identity = NULL;
-static buddy_profile_t   *s_profile = NULL;
 static buddy_privacy_mode_t s_privacy = BUDDY_MODE_PUBLIC;
 
 #define BUDDY_NVS_NS      "buddy"
 #define BUDDY_NVS_KEY_ID  "identity"
-#define BUDDY_NVS_KEY_PROF "profile"
 #define BUDDY_NVS_KEY_PRIV "privacy"
+/* Was the single struct blob; erased on first boot under the per-field scheme.
+ * Kept as a name so the cleanup can find it. */
+#define BUDDY_NVS_KEY_LEGACY_PROF "profile"
 
 /* ── Generate Ed25519 keypair ─────────────────────────────────── */
 static esp_err_t generate_ed25519_keypair(uint8_t *pub, uint8_t *priv)
@@ -86,19 +87,64 @@ fail:
     return ESP_FAIL;
 }
 
+/* ── NVS helpers for the profile ──────────────────────────────────
+ * One entry per field, so nothing here is tied to a struct layout and
+ * BUDDY_PROF_KEY_* is the whole on-disk contract. */
+
+/* Store a string field.  A NULL or empty value erases the key rather than
+ * storing an empty string, which keeps "not set" and "cleared" the same state
+ * and avoids growing the namespace with blank entries. */
+static esp_err_t profile_put_str(nvs_handle_t nvs, const char *key, const char *value)
+{
+    if (!value || !value[0]) {
+        esp_err_t err = nvs_erase_key(nvs, key);
+        return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
+    }
+    return nvs_set_str(nvs, key, value);
+}
+
+/* Read a field, mapping "absent" onto "empty". */
+static esp_err_t profile_get_str(nvs_handle_t nvs, const char *key,
+                                 char *out, size_t size)
+{
+    if (!out || size == 0) return ESP_ERR_INVALID_ARG;
+    out[0] = '\0';
+
+    size_t len = size;
+    esp_err_t err = nvs_get_str(nvs, key, out, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND || err == ESP_ERR_NVS_INVALID_LENGTH) {
+        /* Nothing stored, or a value that no longer fits this build's limit. */
+        out[0] = '\0';
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    return err;
+}
+
 /* ── Compute beacon profile hash ──────────────────────────────── */
 /* The hash is what peers use to notice "this badge is not the one I met", so it
  * has to cover the fields the owner can edit — including the character fields,
  * otherwise rewriting how this person looks and behaves would leave the beacon
  * advertising the old identity. */
-void buddy_profile_compute_hash(const buddy_profile_t *profile, uint8_t hash_out[8])
+void buddy_profile_compute_hash(nvs_handle_t nvs, uint8_t hash_out[8])
 {
+    char name[BUDDY_DISPLAY_NAME_LEN]  = {0};
+    char appearance[BUDDY_APPEARANCE_LEN] = {0};
+    char belongings[BUDDY_BELONGINGS_LEN] = {0};
+    char traits[BUDDY_TRAITS_LEN]      = {0};
+    char tech[BUDDY_TECH_LEVEL_LEN]    = {0};
+
+    profile_get_str(nvs, BUDDY_PROF_KEY_NAME, name, sizeof(name));
+    profile_get_str(nvs, BUDDY_PROF_KEY_APPEARANCE, appearance, sizeof(appearance));
+    profile_get_str(nvs, BUDDY_PROF_KEY_BELONGINGS, belongings, sizeof(belongings));
+    profile_get_str(nvs, BUDDY_PROF_KEY_TRAITS, traits, sizeof(traits));
+    profile_get_str(nvs, BUDDY_PROF_KEY_TECH_LEVEL, tech, sizeof(tech));
+
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "dn", profile->display_name);
-    cJSON_AddStringToObject(root, "ap", profile->appearance);
-    cJSON_AddStringToObject(root, "bl", profile->belongings);
-    cJSON_AddStringToObject(root, "tr", profile->traits);
-    cJSON_AddStringToObject(root, "tl", profile->tech_level);
+    cJSON_AddStringToObject(root, "dn", name);
+    cJSON_AddStringToObject(root, "ap", appearance);
+    cJSON_AddStringToObject(root, "bl", belongings);
+    cJSON_AddStringToObject(root, "tr", traits);
+    cJSON_AddStringToObject(root, "tl", tech);
 
     char *json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -162,33 +208,14 @@ static esp_err_t identity_load_or_generate(void)
 }
 
 /* ── Load profile from NVS ────────────────────────────────────── */
+/* Nothing is loaded into memory here: every field lives in its own NVS entry
+ * and is read on demand.  This only seeds the defaults a brand-new device
+ * should start with, and cleans up the old blob-based key. */
 static esp_err_t profile_load(void)
 {
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READONLY, &nvs);
+    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
-
-    size_t len = sizeof(*s_profile);
-    err = nvs_get_blob(nvs, BUDDY_NVS_KEY_PROF, s_profile, &len);
-
-    if (err == ESP_OK) {
-        /* The blob is a raw struct, so it is only meaningful if it was written
-         * by this exact layout.  An older blob is shorter, and the tail of the
-         * new struct would stay zero — which reads as "the owner emptied every
-         * field that did not exist when they saved", and would advertise an
-         * identity they never chose.  Reject it instead and let the caller fall
-         * back to defaults; the owner re-saves once from the config page. */
-        if (len != sizeof(*s_profile) || s_profile->version != BUDDY_PROFILE_VERSION) {
-            ESP_LOGW(TAG, "Stored profile is version/layout %u (%u bytes, expected %u) "
-                          "— ignoring it and using defaults",
-                     (unsigned)s_profile->version, (unsigned)len,
-                     (unsigned)sizeof(*s_profile));
-            err = ESP_ERR_INVALID_VERSION;
-        } else {
-            buddy_profile_compute_hash(s_profile, s_profile->profile_hash);
-            ESP_LOGI(TAG, "Profile loaded: name=%s", s_profile->display_name);
-        }
-    }
 
     /* Privacy */
     uint8_t priv = BUDDY_MODE_PUBLIC;
@@ -196,20 +223,35 @@ static esp_err_t profile_load(void)
     nvs_get_blob(nvs, BUDDY_NVS_KEY_PRIV, &priv, &plen);
     s_privacy = (buddy_privacy_mode_t)priv;
 
-    nvs_close(nvs);
-    return err;
-}
+    char name[BUDDY_DISPLAY_NAME_LEN] = {0};
+    err = profile_get_str(nvs, BUDDY_PROF_KEY_NAME, name, sizeof(name));
 
-/* ── Default profile ──────────────────────────────────────────── */
-static void profile_set_default(buddy_profile_t *p)
-{
-    memset(p, 0, sizeof(*p));
-    p->version = BUDDY_PROFILE_VERSION;
-    snprintf(p->display_name, sizeof(p->display_name), "Buddy");
-    snprintf(p->bio, sizeof(p->bio), "Exploring the world with Buddy.");
-    /* Left empty on purpose: these are personal, and the chat prompt simply
-     * omits whatever the owner has not filled in. */
-    buddy_profile_compute_hash(p, p->profile_hash);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        /* First boot on this scheme.  If the old single-blob profile is still
+         * around it is dropped — it cannot be reinterpreted safely — and the
+         * owner gets the defaults plus a line in the log.
+         *
+         * A 4-byte probe distinguishes "absent" (NOT_FOUND) from "present but
+         * larger than the probe" (INVALID_LENGTH). */
+        uint8_t probe[4];
+        size_t probe_len = sizeof(probe);
+        esp_err_t probe_err = nvs_get_blob(nvs, BUDDY_NVS_KEY_LEGACY_PROF,
+                                            probe, &probe_len);
+        if (probe_err == ESP_OK || probe_err == ESP_ERR_NVS_INVALID_LENGTH) {
+            ESP_LOGW(TAG, "Discarding the old blob profile; starting from defaults. "
+                          "Fill the Character section once and it will stick from now on.");
+            nvs_erase_key(nvs, BUDDY_NVS_KEY_LEGACY_PROF);
+        }
+
+        profile_put_str(nvs, BUDDY_PROF_KEY_NAME, "Buddy");
+        profile_put_str(nvs, BUDDY_PROF_KEY_BIO, "Exploring the world with Buddy.");
+    }
+
+    nvs_commit(nvs);
+    nvs_close(nvs);
+
+    ESP_LOGI(TAG, "Profile storage ready (per-field NVS keys)");
+    return ESP_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -219,9 +261,8 @@ static void profile_set_default(buddy_profile_t *p)
 esp_err_t buddy_profile_init(void)
 {
     s_identity = heap_caps_calloc(1, sizeof(*s_identity), MALLOC_CAP_SPIRAM);
-    s_profile   = heap_caps_calloc(1, sizeof(*s_profile), MALLOC_CAP_SPIRAM);
-    if (!s_identity || !s_profile) {
-        ESP_LOGE(TAG, "Failed to allocate profile/identity in PSRAM");
+    if (!s_identity) {
+        ESP_LOGE(TAG, "Failed to allocate identity in PSRAM");
         return ESP_ERR_NO_MEM;
     }
 
@@ -231,48 +272,64 @@ esp_err_t buddy_profile_init(void)
         return err;
     }
 
-    err = profile_load();
-    if (err != ESP_OK) {
-        if (err == ESP_ERR_INVALID_VERSION) {
-            ESP_LOGW(TAG, "Stored profile was written by an older layout — using "
-                          "defaults. Open the config page once and save to restore it.");
-        } else {
-            ESP_LOGW(TAG, "No profile in NVS, using defaults");
-        }
-        profile_set_default(s_profile);
-    }
-
-    return ESP_OK;
+    return profile_load();
 }
 
+/* Read every field.  Used where the profile is rendered or sent as a whole; the
+ * fields are stored separately, so this is a convenience view, not the format. */
 esp_err_t buddy_profile_get(buddy_profile_t *out)
 {
     if (!out) return ESP_ERR_INVALID_ARG;
-    memcpy(out, s_profile, sizeof(*out));
+    memset(out, 0, sizeof(*out));
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return err;
+
+    profile_get_str(nvs, BUDDY_PROF_KEY_NAME, out->display_name, sizeof(out->display_name));
+    profile_get_str(nvs, BUDDY_PROF_KEY_BIO, out->bio, sizeof(out->bio));
+    profile_get_str(nvs, BUDDY_PROF_KEY_APPEARANCE, out->appearance, sizeof(out->appearance));
+    profile_get_str(nvs, BUDDY_PROF_KEY_BELONGINGS, out->belongings, sizeof(out->belongings));
+    profile_get_str(nvs, BUDDY_PROF_KEY_TRAITS, out->traits, sizeof(out->traits));
+    profile_get_str(nvs, BUDDY_PROF_KEY_TECH_LEVEL, out->tech_level, sizeof(out->tech_level));
+    profile_get_str(nvs, BUDDY_PROF_KEY_SPEECH, out->speech, sizeof(out->speech));
+    profile_get_str(nvs, BUDDY_PROF_KEY_KNOWS, out->knows, sizeof(out->knows));
+
+    nvs_close(nvs);
     return ESP_OK;
 }
 
+/* Write every field.  The whole set is written at once because that is how the
+ * config page submits it; each one lands in its own key. */
 esp_err_t buddy_profile_set(const buddy_profile_t *profile)
 {
     if (!profile) return ESP_ERR_INVALID_ARG;
-
-    memcpy(s_profile, profile, sizeof(*s_profile));
-    /* Whatever the caller handed over, what goes to NVS is this layout. */
-    s_profile->version = BUDDY_PROFILE_VERSION;
-    buddy_profile_compute_hash(s_profile, s_profile->profile_hash);
 
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READWRITE, &nvs);
     if (err != ESP_OK) return err;
 
-    err = nvs_set_blob(nvs, BUDDY_NVS_KEY_PROF, s_profile, sizeof(*s_profile));
+    err = profile_put_str(nvs, BUDDY_PROF_KEY_NAME, profile->display_name);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_BIO, profile->bio);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_APPEARANCE, profile->appearance);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_BELONGINGS, profile->belongings);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_TRAITS, profile->traits);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_TECH_LEVEL, profile->tech_level);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_SPEECH, profile->speech);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_KNOWS, profile->knows);
+
+    if (err == ESP_OK) {
+        /* The beacon advertises this hash so a peer can tell this badge is not
+         * the one it met before, so it is recomputed from the keys just written
+         * rather than from the caller's copy. */
+        uint8_t hash[8];
+        buddy_profile_compute_hash(nvs, hash);
+        err = nvs_set_blob(nvs, BUDDY_PROF_KEY_HASH, hash, sizeof(hash));
+    }
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
 
-    ESP_LOGI(TAG, "Profile saved: name=%s hash=%02x%02x...%02x",
-             s_profile->display_name,
-             s_profile->profile_hash[0], s_profile->profile_hash[1],
-             s_profile->profile_hash[7]);
+    ESP_LOGI(TAG, "Profile saved: name=%s", profile->display_name);
     return err;
 }
 
@@ -301,4 +358,75 @@ esp_err_t buddy_privacy_set(buddy_privacy_mode_t mode)
 buddy_privacy_mode_t buddy_privacy_get(void)
 {
     return s_privacy;
+}
+
+bool buddy_profile_get_hash(uint8_t hash_out[8])
+{
+    if (!hash_out) return false;
+    memset(hash_out, 0, 8);
+
+    nvs_handle_t nvs;
+    if (nvs_open(BUDDY_NVS_NS, NVS_READONLY, &nvs) != ESP_OK) return false;
+
+    size_t len = 8;
+    bool ok = (nvs_get_blob(nvs, BUDDY_PROF_KEY_HASH, hash_out, &len) == ESP_OK &&
+               len == 8);
+    nvs_close(nvs);
+    return ok;
+}
+
+esp_err_t buddy_profile_get_field(const char *key, char *out, size_t size)
+{
+    if (!key || !out || size == 0) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = profile_get_str(nvs, key, out, size);
+    nvs_close(nvs);
+    return err;
+}
+
+/* Read several fields over one NVS open.  The pair accessor below is the only
+ * caller that wants more than one field at a time, and opening the namespace
+ * six times for one turn is wasteful on a device this tight on memory. */
+size_t buddy_profile_get_fields(const char **keys, char *const *outs,
+                                const size_t *sizes, size_t count)
+{
+    if (!keys || !outs || !sizes || count == 0) return 0;
+
+    nvs_handle_t nvs;
+    if (nvs_open(BUDDY_NVS_NS, NVS_READONLY, &nvs) != ESP_OK) return 0;
+
+    size_t found = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (profile_get_str(nvs, keys[i], outs[i], sizes[i]) == ESP_OK) found++;
+    }
+
+    nvs_close(nvs);
+    return found;
+}
+
+esp_err_t buddy_profile_set_field(const char *key, const char *value)
+{
+    if (!key) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = profile_put_str(nvs, key, value);
+    if (err == ESP_OK) {
+        /* The beacon's hash covers the character fields, so it has to be
+         * refreshed after any single-field edit too — otherwise the owner could
+         * rewrite how this person looks and peers would still recognise the old
+         * identity from the beacon. */
+        uint8_t hash[8];
+        buddy_profile_compute_hash(nvs, hash);
+        err = nvs_set_blob(nvs, BUDDY_PROF_KEY_HASH, hash, sizeof(hash));
+    }
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
 }

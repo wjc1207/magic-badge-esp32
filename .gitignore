@@ -37,6 +37,10 @@ main/mimi_secrets.h
 # Reference repos
 nanobot/
 
+# Character-card sandbox: local voice-iteration harness. It reads a local API key
+# and writes model transcripts, so none of it belongs in history.
+tools/charcard/
+
 # MCP / Memov
 .mcp.json
 .mem/

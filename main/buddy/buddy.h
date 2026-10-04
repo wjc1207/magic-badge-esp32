@@ -27,23 +27,73 @@
 #define BUDDY_REHANDSHAKE_COOLDOWN_S (30 * 60)
 
 /* ── Profile limits ──────────────────────────────────────────── */
-/* Upper bound on a profile *exchanged over BLE* — the buffer that holds the
- * serialized JSON, and the largest blob a peer is allowed to write.  The
- * character fields below are local-only (never serialized, see
- * serialize_profile()) so they do not have to fit here, but the struct they
- * belong to does: it is stored as one NVS blob and copied around as a unit.
- * The _Static_assert below keeps the two in step. */
+/* Upper bound on a profile *exchanged over BLE*: the buffer that holds the
+ * serialized JSON, and the largest write a peer may send.  It is a wire limit,
+ * not a storage or layout constraint — the profile itself is kept as one NVS
+ * entry per field (see BUDDY_PROF_KEY_* below), so nothing here is on-disk
+ * format.
+ *
+ * Roomier than the current JSON needs, on purpose: an older peer may still send
+ * the tag/contact block that this firmware no longer stores, and rejecting its
+ * write would silently break the exchange. */
 #define BUDDY_PROFILE_MAX_BYTES     4096
 #define BUDDY_DEVICE_ID_LEN         18
 #define BUDDY_DISPLAY_NAME_LEN      32
-#define BUDDY_BIO_LEN               1024
+#define BUDDY_BIO_LEN               2048
 /* Character material is only ever read by this badge's own model, so these are
- * sized for comfortable prose rather than for a radio frame. */
-#define BUDDY_APPEARANCE_LEN        512   /* what the person looks like */
-#define BUDDY_BELONGINGS_LEN        512   /* what they carry on them */
-#define BUDDY_TRAITS_LEN            128   /* three words, comma separated */
-#define BUDDY_TECH_LEVEL_LEN        64
+ * sized for comfortable prose rather than for a radio frame.  NVS allows about
+ * 4000 bytes per entry, which is the only real ceiling here. */
+#define BUDDY_APPEARANCE_LEN        1024  /* what the person looks like */
+#define BUDDY_BELONGINGS_LEN        1024  /* what they carry on them */
+#define BUDDY_TRAITS_LEN            256   /* three words, comma separated */
+#define BUDDY_TECH_LEVEL_LEN        128   /* the setting's technology, not the wearer's skill */
+/* How this person talks: dialect, register, how long their sentences run.
+ *
+ * Separate from tech_level because they are different things and conflating them
+ * broke both.  A character sheet that used tech_level to say "普通话为主，带轻粤语"
+ * left the field holding something its own form never asked for: the input is
+ * labelled "World tech level" and is meant for the setting the character lives
+ * in.
+ *
+ * Roomier than tech_level on purpose: this is the single most load-bearing field
+ * for making the model speak as a particular person, and it needs room for a
+ * short prohibition list. */
+#define BUDDY_SPEECH_LEN            256
+/* The edge of this character's knowledge: the things they have heard of.
+ *
+ * Two characters can come from settings that do not share a single proper noun,
+ * and a badge exchanges only appearance and belongings — no name, no history, no
+ * world.  Without this, a crossover encounter is whatever the model happens to
+ * infer from a stranger's coat.  With it, the model has an explicit boundary to
+ * run the other person's belongings against, and "what is that?" becomes a
+ * natural turn instead of luck.
+ *
+ * A list rather than prose: proper nouns and concepts, not a paragraph.  The
+ * firmware supplies the sentence that turns it into a boundary, so every wearer
+ * gets the same behaviour and nobody has to phrase it themselves. */
+#define BUDDY_KNOWS_LEN             512
 #define BUDDY_MAX_CONTACTS          500
+
+/* ── Profile NVS keys ────────────────────────────────────────── */
+/* The user profile is stored as one NVS entry per field.  NVS is a key-value
+ * store, and keeping the profile as a single opaque blob meant every layout
+ * change invalidated it and silently reset the owner's settings on the next
+ * boot.
+ *
+ * One key per field makes adding a field free: an existing device simply has no
+ * value for the new key and the default applies.  No version number, nothing to
+ * migrate, nothing to remember.
+ *
+ * NVS caps key names at 15 characters. */
+#define BUDDY_PROF_KEY_NAME        "name"
+#define BUDDY_PROF_KEY_BIO         "bio"
+#define BUDDY_PROF_KEY_APPEARANCE  "appearance"
+#define BUDDY_PROF_KEY_BELONGINGS  "belongings"
+#define BUDDY_PROF_KEY_TRAITS      "traits"
+#define BUDDY_PROF_KEY_TECH_LEVEL  "tech_level"
+#define BUDDY_PROF_KEY_SPEECH      "speech"
+#define BUDDY_PROF_KEY_KNOWS       "knows"
+#define BUDDY_PROF_KEY_HASH        "prof_hash"
 
 /* ── Proximity classes ───────────────────────────────────────── */
 typedef enum {
@@ -67,22 +117,19 @@ typedef enum {
 } buddy_privacy_mode_t;
 
 /* ── User profile ────────────────────────────────────────────── */
-/* Bump BUDDY_PROFILE_VERSION whenever a field is added or removed.
+/* The fields, together, for the places that render or receive the profile as a
+ * whole: the config page, `buddy_status`, and the JSON form exchanged over BLE.
  *
- * This struct is what goes into the NVS blob, so its layout is on-disk format:
- * an older blob is shorter, and nvs_get_blob() only reports that it was shorter
- * — the bytes past its end stay zero in the new struct, which reads as "the
- * user cleared every field that came after".  profile_load() rejects a version
- * it does not know rather than silently presenting an empty profile. */
-#define BUDDY_PROFILE_VERSION   4
-
+ * This is a *view*, not storage.  Everything is written per field (see the
+ * BUDDY_PROF_KEY_* names above), so no layout here is on-disk format and none
+ * of it can invalidate what the owner already saved. */
 typedef struct {
-    uint8_t  version;
     char     display_name[BUDDY_DISPLAY_NAME_LEN];
     char     bio[BUDDY_BIO_LEN];
     /* Character material for the live chat: what this person looks like, what
-     * they carry, three words for their temperament, and how technical they
-     * are.  These are what turn a name into somebody the model can speak as.
+     * they carry, three words for their temperament, how technical they are, and
+     * how they talk.  These are what turn a name into somebody the model can
+     * speak as.
      *
      * Local only — never serialized onto the BLE profile characteristic.  Each
      * badge speaks as its own wearer from its own copy, so the peer's model has
@@ -92,23 +139,9 @@ typedef struct {
     char     belongings[BUDDY_BELONGINGS_LEN];
     char     traits[BUDDY_TRAITS_LEN];        /* three words, comma separated */
     char     tech_level[BUDDY_TECH_LEVEL_LEN];
-    uint8_t  profile_hash[BUDDY_PROFILE_HASH_LEN];
+    char     speech[BUDDY_SPEECH_LEN];        /* dialect and register */
+    char     knows[BUDDY_KNOWS_LEN];          /* the edge of what this character knows */
 } buddy_profile_t;
-
-/* Catch, at build time, the two ways this layout can break:
- *
- *  - the struct outgrowing BUDDY_PROFILE_MAX_BYTES, which is the size NVS writes
- *    are validated against — get that wrong and a "saved" profile is judged
- *    invalid on the next boot and silently replaced with defaults;
- *  - the struct outgrowing BUDDY_PROFILE_MAX_BYTES - 64, which the GATT server
- *    refuses to write, so a peer could never send a full one.
- *
- * A failing assertion here means adjusting a length constant, not debugging
- * Bluetooth. */
-_Static_assert(sizeof(buddy_profile_t) <= BUDDY_PROFILE_MAX_BYTES,
-               "buddy_profile_t does not fit BUDDY_PROFILE_MAX_BYTES");
-_Static_assert(sizeof(buddy_profile_t) + 64 <= BUDDY_PROFILE_MAX_BYTES,
-               "buddy_profile_t leaves no room for a peer's profile write");
 
 /* ── Device identity (generated once at first boot) ──────────── */
 typedef struct {
@@ -118,13 +151,17 @@ typedef struct {
 } buddy_identity_t;
 
 /* ── Contact record (stored on-device only) ──────────────────── */
-/* What is known about a badge this one has met.  Kept deliberately small: the
- * match score, icebreaker and shared-interests fields went away with the
- * tag-based matching feature they belonged to. */
+/* What is known about a badge this one has met: its device id and what the
+ * profile exchange revealed about its wearer.
+ *
+ * No name and no bio — neither is transmitted, and a badge only learns a name if
+ * the person says it during a conversation.  The match score, icebreaker and
+ * shared-interests fields went away with the tag-based matching feature they
+ * belonged to. */
 typedef struct {
     char     peer_id[BUDDY_DEVICE_ID_LEN];
-    char     display_name[BUDDY_DISPLAY_NAME_LEN];
-    char     bio[BUDDY_BIO_LEN];
+    char     appearance[BUDDY_APPEARANCE_LEN];
+    char     belongings[BUDDY_BELONGINGS_LEN];
     int64_t  last_met_unix;
     uint16_t meeting_count;
 } buddy_contact_record_t;
@@ -137,13 +174,17 @@ typedef enum {
     BUDDY_EVT_PROFILE_READY,
 } buddy_event_type_t;
 
+/* Carries what a link actually revealed: the peer's identity and the visible
+ * half of its wearer.  Small by design — the consumer stores it, not a pointer
+ * to something it has to remember to free. */
 typedef struct {
     buddy_event_type_t type;
     uint8_t  peer_mac[6];
     char     peer_device_id[BUDDY_DEVICE_ID_LEN];
     int8_t   rssi;
     buddy_proximity_t proximity;
-    buddy_profile_t   *peer_profile;   /* allocated from PSRAM, consumer frees */
+    char     peer_appearance[BUDDY_APPEARANCE_LEN];
+    char     peer_belongings[BUDDY_BELONGINGS_LEN];
     bool     peer_profile_valid;
 } buddy_event_t;
 

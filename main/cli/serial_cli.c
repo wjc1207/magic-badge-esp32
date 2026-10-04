@@ -14,6 +14,7 @@
 #include "heartbeat/heartbeat.h"
 #include "skills/skill_loader.h"
 #include "buddy/buddy.h"
+#include "buddy/buddy_profile.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -811,12 +812,18 @@ static int cmd_buddy_status(int argc, char **argv)
             printf("Look:   %s\n", profile->appearance[0] ? profile->appearance : "(not set)");
             printf("Carry:  %s\n", profile->belongings[0] ? profile->belongings : "(not set)");
             printf("Traits: %s\n", profile->traits[0] ? profile->traits : "(not set)");
-            printf("Tech:   %s\n", profile->tech_level[0] ? profile->tech_level : "(not set)");
-            printf("Hash:   %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                   profile->profile_hash[0], profile->profile_hash[1],
-                   profile->profile_hash[2], profile->profile_hash[3],
-                   profile->profile_hash[4], profile->profile_hash[5],
-                   profile->profile_hash[6], profile->profile_hash[7]);
+            printf("World:  %s\n", profile->tech_level[0] ? profile->tech_level : "(not set)");
+            printf("Speech: %s\n", profile->speech[0] ? profile->speech : "(not set)");
+            printf("Knows:  %s\n", profile->knows[0] ? profile->knows : "(not set)");
+
+            uint8_t hash[8] = {0};
+            if (buddy_profile_get_hash(hash)) {
+                printf("Hash:   %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       hash[0], hash[1], hash[2], hash[3],
+                       hash[4], hash[5], hash[6], hash[7]);
+            } else {
+                printf("Hash:   (not saved yet)\n");
+            }
         }
         heap_caps_free(profile);
     }
@@ -830,8 +837,10 @@ static int cmd_buddy_status(int argc, char **argv)
         buddy_contacts_list(recs, 10, &count);
         printf("\nContacts: %d\n", (int)count);
         for (size_t i = 0; i < count && i < 5; i++) {
-            printf("  %s - %s (met %lld, x%d)\n",
-                   recs[i].peer_id, recs[i].display_name,
+            /* No name to show: badges do not exchange them, so a contact is known
+             * by its device id and whatever was visible about its wearer. */
+            printf("  %s (met %lld, x%d)\n",
+                   recs[i].peer_id,
                    (long long)recs[i].last_met_unix,
                    (int)recs[i].meeting_count);
         }

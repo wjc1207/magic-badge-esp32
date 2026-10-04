@@ -475,6 +475,7 @@ static esp_err_t llm_http_call(const char *post_data, resp_buf_t *rb, int *out_s
 
 static void extract_text_anthropic(cJSON *root, char *buf, size_t size)
 {
+    if (!buf || size < 2) return;
     buf[0] = '\0';
     cJSON *content = cJSON_GetObjectItem(root, "content");
     if (!content || !cJSON_IsArray(content)) return;
@@ -496,6 +497,7 @@ static void extract_text_anthropic(cJSON *root, char *buf, size_t size)
 
 static void extract_text_openai(cJSON *root, char *buf, size_t size)
 {
+    if (!buf || size < 2) return;
     buf[0] = '\0';
     cJSON *choices = cJSON_GetObjectItem(root, "choices");
     if (!choices || !cJSON_IsArray(choices)) return;
@@ -505,8 +507,30 @@ static void extract_text_openai(cJSON *root, char *buf, size_t size)
     if (!message) return;
     cJSON *content = cJSON_GetObjectItem(message, "content");
     if (!content || !cJSON_IsString(content)) return;
-    strncpy(buf, content->valuestring, size - 1);
-    buf[size - 1] = '\0';
+
+    size_t len = strlen(content->valuestring);
+    if (len > size - 1) {
+        len = size - 1;
+        /* Back off to a character boundary.  Without this the copy ends on a
+         * leading or continuation byte of a multi-byte character, and that
+         * fragment is then valid UTF-8 as far as every later check is
+         * concerned — it goes over BLE and into the transcript, where it shows
+         * up as a replacement glyph in the middle of the next turn's context.
+         *
+         * Cutting the line short is still wrong for dialogue; this only stops it
+         * also being invalid.  chat_fit_reply() in buddy_chat.c is what keeps the
+         * cut at a sentence or clause break. */
+        while (len > 0 && ((unsigned char)content->valuestring[len] & 0xC0) == 0x80) {
+            len--;
+        }
+        ESP_LOGW(TAG, "LLM response was %u bytes and did not fit %u; "
+                      "cut to %u at a character boundary",
+                 (unsigned)strlen(content->valuestring), (unsigned)size,
+                 (unsigned)len);
+    }
+
+    memcpy(buf, content->valuestring, len);
+    buf[len] = '\0';
 }
 
 static cJSON *convert_tools_openai(const char *tools_json)

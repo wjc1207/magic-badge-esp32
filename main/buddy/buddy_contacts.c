@@ -81,8 +81,8 @@ esp_err_t buddy_contacts_upsert(const buddy_contact_record_t *rec)
 
     cJSON *entry = cJSON_CreateObject();
     cJSON_AddStringToObject(entry, "peer_id", rec->peer_id);
-    cJSON_AddStringToObject(entry, "display_name", rec->display_name);
-    cJSON_AddStringToObject(entry, "bio", rec->bio);
+    cJSON_AddStringToObject(entry, "appearance", rec->appearance);
+    cJSON_AddStringToObject(entry, "belongings", rec->belongings);
     cJSON_AddNumberToObject(entry, "last_met_unix", (double)unix_now());
     cJSON_AddNumberToObject(entry, "meeting_count", rec->meeting_count + 1);
 
@@ -129,10 +129,10 @@ esp_err_t buddy_contacts_get(const char *peer_id, buddy_contact_record_t *out)
             memset(out, 0, sizeof(*out));
             snprintf(out->peer_id, sizeof(out->peer_id), "%s",
                      cJSON_GetObjectItem(item, "peer_id")->valuestring);
-            cJSON *dn = cJSON_GetObjectItem(item, "display_name");
-            if (dn) snprintf(out->display_name, sizeof(out->display_name), "%s", dn->valuestring);
-            cJSON *bi = cJSON_GetObjectItem(item, "bio");
-            if (bi) snprintf(out->bio, sizeof(out->bio), "%s", bi->valuestring);
+            cJSON *ap = cJSON_GetObjectItem(item, "appearance");
+            if (ap) snprintf(out->appearance, sizeof(out->appearance), "%s", ap->valuestring);
+            cJSON *bl = cJSON_GetObjectItem(item, "belongings");
+            if (bl) snprintf(out->belongings, sizeof(out->belongings), "%s", bl->valuestring);
             cJSON *lm = cJSON_GetObjectItem(item, "last_met_unix");
             if (lm) out->last_met_unix = (int64_t)lm->valuedouble;
             cJSON *mc = cJSON_GetObjectItem(item, "meeting_count");

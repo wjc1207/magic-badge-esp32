@@ -3,6 +3,7 @@
 #include "mimi_config.h"
 #include "wifi/wifi_manager.h"
 #include "buddy/buddy.h"
+#include "buddy/buddy_profile.h"
 #include "sdkconfig.h"
 
 #include <stdint.h>
@@ -391,6 +392,8 @@ static esp_err_t http_get_config(httpd_req_t *req)
         cJSON_AddStringToObject(root, "buddy_belongings", bp.belongings);
         cJSON_AddStringToObject(root, "buddy_traits", bp.traits);
         cJSON_AddStringToObject(root, "buddy_tech_level", bp.tech_level);
+        cJSON_AddStringToObject(root, "buddy_speech", bp.speech);
+        cJSON_AddStringToObject(root, "buddy_knows", bp.knows);
     }
     cJSON_AddBoolToObject(root, "buddy_privacy",
                           buddy_privacy_get() == BUDDY_MODE_PRIVATE);
@@ -614,6 +617,8 @@ static esp_err_t http_post_save(httpd_req_t *req)
         SYNC_BUDDY_FIELD("buddy_belongings", bp.belongings, sizeof(bp.belongings));
         SYNC_BUDDY_FIELD("buddy_traits", bp.traits, sizeof(bp.traits));
         SYNC_BUDDY_FIELD("buddy_tech_level", bp.tech_level, sizeof(bp.tech_level));
+        SYNC_BUDDY_FIELD("buddy_speech", bp.speech, sizeof(bp.speech));
+        SYNC_BUDDY_FIELD("buddy_knows", bp.knows, sizeof(bp.knows));
 
         buddy_profile_set(&bp);
 

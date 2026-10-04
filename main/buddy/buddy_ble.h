@@ -28,6 +28,14 @@
 #define BUDDY_BLE_ADV_PERIOD_MS      125
 #define BUDDY_BLE_ADV_JITTER_MS      25
 #define BUDDY_BLE_SCAN_INTERVAL_MS   1000
+
+/* How long two badges ignore each other after finishing a conversation.
+ *
+ * Without this they reconnect the instant the link drops — both are advertising
+ * and scanning again within milliseconds — and the same couple talks round after
+ * round with nobody walking anywhere.  The cooldown is per peer, so meeting a
+ * different badge is unaffected, and it is cleared by reboot. */
+#define BUDDY_RECHAT_COOLDOWN_MS     (3 * 60 * 1000LL)
 #define BUDDY_BLE_SCAN_WINDOW_MS     300   /* 30% duty, was 80% */
 
 /* ── GATT service / characteristic UUIDs (128-bit) ─────────────── */
@@ -68,6 +76,13 @@
  * ATT MTU minus the 3-byte ATT header, whichever is smaller. */
 #define BUDDY_CHAT_MSG_MAX       200
 #define BUDDY_ATT_HEADER_LEN     3
+
+/* ── Profile exchange chunking ─────────────────────────────────── */
+/* A profile is sent as a series of plain ATT writes, each of which must fit one
+ * write request (MTU - 3 bytes).  This is the header-inclusive size of one
+ * chunk: comfortably under the smallest MTU this firmware negotiates (247), so
+ * no chunk can be rejected for length. */
+#define BUDDY_PROF_CHUNK_MAX     240
 
 /* ── Connection parameters for a chat session ──────────────────── */
 /* The badge is USB-powered and chat latency matters more than power,
@@ -156,6 +171,34 @@ void buddy_ble_terminate_link(void);
  * network state changes, otherwise BUDDY_FLAG_NET_OK goes stale.
  */
 void buddy_ble_refresh_adv_flags(void);
+
+/**
+ * What the peer's badge said about its wearer, from the profile exchange.
+ * Returns false when nothing has been exchanged yet.
+ *
+ * Only the visible half is ever transmitted or stored — how they look and what
+ * they carry.  A name is not something one badge tells another; it is learned
+ * from the person saying it.
+ *
+ * The profile event queue is drained by the contact task, so this separate copy
+ * is how a dialogue learns who is standing in front of it.  It is cleared when a
+ * new link comes up, so a session can never describe a previous meeting.
+ */
+bool buddy_ble_peer_profile(char *appearance, size_t appearance_size,
+                            char *belongings, size_t belongings_size);
+
+/**
+ * Forget the cached peer profile.
+ */
+void buddy_ble_clear_peer_profile(void);
+
+/**
+ * Record that a conversation with this peer just ended, starting its cool-down.
+ * Until it expires this badge will not open another link to that peer, which is
+ * what keeps two nearby badges from re-chatting in a loop.  Called by the chat
+ * session as it tears the link down.
+ */
+void buddy_ble_note_round_complete(const char *peer_device_id);
 
 /**
  * Current RSSI of the active link, or 0 when idle.

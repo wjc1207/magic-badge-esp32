@@ -74,3 +74,12 @@ CONFIG_BT_NIMBLE_ACL_BUF_COUNT=24
 # 251 = 247 + 4 (L2CAP header), i.e. one full MTU-sized PDU per buffer.
 CONFIG_BT_NIMBLE_ACL_BUF_SIZE=251
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=251
+
+# NimBLE host task stack.  The default is 4096, and this firmware puts real work
+# on that task: the GATT access callbacks, the profile exchange, and the
+# disconnect handler all run there, and the profile fields they handle are
+# hundreds of bytes each.  Two 1 KB locals in that path — well under the biggest
+# buffer the code was allowed to use — overflowed 4096 and rebooted the badge on
+# every disconnect.  8192 leaves room for the field-sized buffers this path may
+# legitimately need without turning a routine edit into a crash.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192

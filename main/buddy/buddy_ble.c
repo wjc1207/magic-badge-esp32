@@ -31,6 +31,31 @@
 
 static const char *TAG = "buddy_ble";
 
+/* ── Profile exchange framing ──────────────────────────────────── */
+/* Neither direction of a profile fits one ATT operation (MTU - 3 = 244 bytes
+ * here, against several hundred bytes of JSON), and neither of ATT's "long"
+ * procedures worked between two copies of this firmware:
+ *
+ *   Write Long   -> the peer's server answered BLE_ATT_ERR_INVALID_OFFSET
+ *   Read Long    -> the peer's server answered BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN
+ *
+ * So both directions are carried by a windowing scheme built on ordinary writes
+ * and reads, which the ATT layer transports without interpretation:
+ *
+ *   write   ['S'|'E'][payload]   one chunk of my profile ('E' = final chunk)
+ *   write   [0x3F][off_lo][off_hi]  "send me the window at this offset"
+ *   read    ['S'|'E'][payload]   one window of your profile
+ *
+ * The marker byte also keeps a window from ever filling the response: the
+ * payload stays one byte short of the ceiling. */
+#define CHAT_CHUNK_MORE    'S'   /* more chunks follow */
+#define CHAT_CHUNK_LAST    'E'   /* final chunk */
+#define PROFILE_CMD_GET    0x3F  /* read request (distinct from both markers) */
+
+/* Window size the reader asks for.  The reply is this plus the marker, so it
+ * stays inside BUDDY_PROF_CHUNK_MAX and therefore inside MTU - 3. */
+#define PROFILE_READ_WINDOW  (BUDDY_PROF_CHUNK_MAX - 1)
+
 /* ── Peer tracking (beacon dedup + handshake cooldown) ────────── */
 #define PEER_TRACK_MAX 32
 
@@ -136,6 +161,15 @@ static bool     s_chat_ready_sent = false;    /* BUDDY_CHAT_RX_LINK_READY alread
 /* Advertising payload is rebuilt whenever the dynamic flags change. */
 static uint8_t s_adv_mfg[18];
 
+/* What the last peer profile read revealed about its wearer, kept for the chat
+ * task: the profile event queue belongs to the contact task, and the link is
+ * already down by the time a dialogue ends.  Written from the NimBLE host task,
+ * read from the chat task, hence the lock. */
+static char                s_peer_appearance[BUDDY_APPEARANCE_LEN];
+static char                s_peer_belongings[BUDDY_BELONGINGS_LEN];
+static bool                s_peer_profile_for_chat_valid = false;
+static SemaphoreHandle_t   s_peer_profile_lock = NULL;
+
 /* ── BLE UUIDs ─────────────────────────────────────────────────── */
 static const ble_uuid128_t g_buddy_svc_uuid =
     BLE_UUID128_INIT(BUDDY_SVC_UUID);
@@ -156,6 +190,17 @@ static void gatt_start_read(uint16_t conn_handle);
 static void gatt_start_chat_setup(uint16_t conn_handle);
 static void gatt_start_discovery(uint16_t conn_handle);
 
+/* When the last conversation finished, whatever peer it was with.
+ *
+ * The per-peer cool-down below is the nice version — it lets us go and talk to
+ * somebody *else* immediately — but it depends on recognising the same peer
+ * across two different spellings of its address, and getting that wrong means
+ * no cool-down at all.  This global gate has no such dependency: after any
+ * conversation, outbound connections stop for the cool-down window.  It is the
+ * backstop that makes "two badges sitting next to each other" impossible to turn
+ * into an endless conversation, even if peer identification fails. */
+static int64_t s_last_session_end_ms = 0;
+
 /* ── Peer tracking helpers ─────────────────────────────────────── */
 static peer_track_t *peer_find_by_mac(const uint8_t *mac)
 {
@@ -173,12 +218,41 @@ static peer_track_t *peer_find_or_add(const uint8_t *mac)
     if (s_peer_count < PEER_TRACK_MAX) {
         p = &s_peers[s_peer_count++];
     } else {
-        /* Evict oldest */
-        int oldest = 0;
-        for (int i = 1; i < PEER_TRACK_MAX; i++) {
-            if (s_peers[i].last_ad_ms < s_peers[oldest].last_ad_ms) oldest = i;
+        /* Evict the least useful entry — but never one that is still cooling
+         * down from a conversation.
+         *
+         * This used to evict purely on "oldest advertisement", which quietly
+         * destroyed the anti-rechat cooldown: in any room with a few dozen
+         * advertisers the peer we just talked to was evicted within seconds,
+         * its cooldown went with it, and the two badges reconnected and talked
+         * another round, forever.  A cool-down entry is the only thing standing
+         * between us and that loop, so it outranks everything here.
+         *
+         * If every slot is cooling down (unlikely — that needs 32 recent
+         * partners) the entries that never connected are the safest to drop;
+         * otherwise the oldest advertisement goes. */
+        int64_t now = esp_timer_get_time() / 1000LL;
+        int victim = -1;
+
+        for (int i = 0; i < PEER_TRACK_MAX; i++) {
+            if (s_peers[i].last_conn_ms > 0 &&
+                (now - s_peers[i].last_conn_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+                continue;   /* still cooling down — protected */
+            }
+            if (victim < 0 ||
+                s_peers[i].last_ad_ms < s_peers[victim].last_ad_ms) {
+                victim = i;
+            }
         }
-        p = &s_peers[oldest];
+
+        if (victim < 0) {
+            /* Everything is protected; drop the oldest regardless. */
+            victim = 0;
+            for (int i = 1; i < PEER_TRACK_MAX; i++) {
+                if (s_peers[i].last_ad_ms < s_peers[victim].last_ad_ms) victim = i;
+            }
+        }
+        p = &s_peers[victim];
     }
 
     memset(p, 0, sizeof(*p));
@@ -186,26 +260,86 @@ static peer_track_t *peer_find_or_add(const uint8_t *mac)
     return p;
 }
 
-static bool peer_should_connect(const uint8_t *mac)
+/* A conversation with `mac` has finished; start its cool-down.
+ *
+ * Recorded per peer id and looked up at the end of a session, because the
+ * cooldown is about *this* pairing: talking to a different badge later should
+ * not be delayed by it. */
+void buddy_ble_note_round_complete(const char *peer_device_id)
 {
-    peer_track_t *p = peer_find_by_mac(mac);
-    if (!p) return true;
+    if (!peer_device_id || !peer_device_id[0] || !s_peers) return;
 
-    if (p->blocked) return false;
+    /* The gate that does not depend on identifying the peer. */
+    s_last_session_end_ms = esp_timer_get_time() / 1000LL;
 
+    /* Match on the device id or on the BLE address.
+     *
+     * These are two different strings for the same peer, and confusing them is
+     * what made this function silently do nothing: the profile's device id is
+     * the WiFi MAC (esp_read_mac(ESP_MAC_WIFI_STA)) while the connection's
+     * identity address is the BT MAC — two octets apart.  The peer entry may
+     * have been created from either, so accept both. */
+    for (int i = 0; i < s_peer_count; i++) {
+        char mac_str[18];
+        snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 s_peers[i].mac[0], s_peers[i].mac[1], s_peers[i].mac[2],
+                 s_peers[i].mac[3], s_peers[i].mac[4], s_peers[i].mac[5]);
+
+        if (strcmp(s_peers[i].device_id, peer_device_id) == 0 ||
+            strcmp(mac_str, peer_device_id) == 0) {
+            s_peers[i].last_conn_ms = esp_timer_get_time() / 1000LL;
+            ESP_LOGI(TAG, "Cooling down %s for %lld s after this conversation",
+                     peer_device_id, BUDDY_RECHAT_COOLDOWN_MS / 1000);
+            return;
+        }
+    }
+
+    /* Not fatal any more — the global gate above covers this peer regardless —
+     * but it means per-peer tracking missed, which is worth knowing. */
+    ESP_LOGW(TAG, "Conversation with %s ended but it is not in the peer table — "
+                  "only the global cool-down applies", peer_device_id);
+}
+
+/* Why an advertisement should not become a connection, or NULL if it should.
+ *
+ * Returned as a string so the scan path can name the specific gate, including
+ * the global one — "we are deliberately not re-chatting" and "the radio never
+ * saw the peer" used to look identical in the log. */
+static const char *peer_connect_reject_reason(const uint8_t *mac)
+{
     int64_t now = esp_timer_get_time() / 1000LL;
 
-    /* 30-min cooldown after last connection */
-    if (p->last_conn_ms > 0 && (now - p->last_conn_ms) < (30 * 60 * 1000LL)) {
-        return false;
+    /* Global gate first: if we finished a conversation recently, do not open
+     * another link to anyone, whatever the per-peer record says.  Peer identity
+     * is derived from two different addresses (the WiFi MAC a badge reports in
+     * its profile, and the BT address that the connection and the scan see), and
+     * a mismatch there left this decision with no cool-down at all, which is how
+     * the two badges came to talk round after round.  This branch cannot
+     * mismatch — and it is deliberately checked *before* the unknown-peer
+     * shortcut below, which would otherwise let the very first advertisement
+     * after a session straight through. */
+    if (s_last_session_end_ms > 0 &&
+        (now - s_last_session_end_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+        return "session cooldown";
+    }
+
+    peer_track_t *p = peer_find_by_mac(mac);
+    if (!p) return NULL;
+
+    if (p->blocked) return "blocked peer";
+
+    /* Per-peer record, which is what lets us talk to somebody *else* while this
+     * one is still cooling down. */
+    if (p->last_conn_ms > 0 && (now - p->last_conn_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+        return "peer cooldown";
     }
 
     /* 2-second dedup */
     if (p->last_ad_ms > 0 && (now - p->last_ad_ms) < 2000) {
-        return false;
+        return "advertisement dedup";
     }
 
-    return true;
+    return NULL;
 }
 
 /* ── Advertising setup ─────────────────────────────────────────── */
@@ -232,14 +366,10 @@ static void buddy_ble_build_adv_fields(struct ble_hs_adv_fields *fields)
            &dev_id_bytes[0], &dev_id_bytes[1], &dev_id_bytes[2],
            &dev_id_bytes[3], &dev_id_bytes[4], &dev_id_bytes[5]);
 
-    buddy_profile_t *profile = heap_caps_calloc(1, sizeof(*profile), MALLOC_CAP_SPIRAM);
+    /* Read straight from NVS: the hash is stored on its own, so building the
+     * advertising payload no longer means materialising the whole profile. */
     uint8_t profile_hash[8] = {0};
-    if (profile) {
-        if (buddy_profile_get(profile) == ESP_OK) {
-            memcpy(profile_hash, profile->profile_hash, 8);
-        }
-        heap_caps_free(profile);
-    }
+    buddy_profile_get_hash(profile_hash);
 
     /* company_id(2) + version(1) + device_id(6) + hash(8) + flags(1) */
     s_adv_mfg[0] = BUDDY_MFG_COMPANY_ID & 0xFF;
@@ -256,30 +386,32 @@ static void buddy_ble_build_adv_fields(struct ble_hs_adv_fields *fields)
 }
 
 /* Human-readable name, for someone scanning with a phone rather than for the
- * badge-to-badge protocol — that one keys off the manufacturer data.  The name
- * is derived rather than configured so it cannot drift out of sync with the
- * device id the badge advertises. */
+ * badge-to-badge protocol — that one keys off the manufacturer data.
+ *
+ * Derived from the *chip's* WiFi MAC, which is exactly the value a new device
+ * identity is generated from (buddy_profile.c: esp_read_mac(ESP_MAC_WIFI_STA)).
+ * It deliberately does not read the stored identity blob: that blob is written
+ * once at first boot and persists, so a badge whose identity predates a change
+ * in how the id is derived advertises a name that matches nothing — which is how
+ * "MagicBadge-E830" came to be running with a device id of ...:79:58, and why
+ * an earlier cool-down keyed on identity could never find the peer it had just
+ * talked to. */
 #define BUDDY_BLE_NAME_PREFIX "MagicBadge-"
 
 static char s_adv_name[sizeof(BUDDY_BLE_NAME_PREFIX) + 4];
 
 static const char *buddy_ble_adv_name(void)
 {
-    const buddy_identity_t *id = buddy_identity_get();
-    unsigned octet[6] = {0};
+    static bool resolved = false;
 
-    /* The identity is a heap object that only exists once the profile has
-     * loaded, and on_sync() asks for the name unconditionally — so both "not
-     * loaded yet" and "unparseable id" have to land on something printable
-     * rather than an empty or missing name field. */
-    if (id != NULL &&
-        sscanf(id->device_id, "%x:%x:%x:%x:%x:%x",
-               &octet[0], &octet[1], &octet[2],
-               &octet[3], &octet[4], &octet[5]) == 6) {
+    /* on_sync() asks for the name unconditionally, so it has to be valid the
+     * first time it is called — hence the cache, filled once. */
+    if (!resolved) {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
         snprintf(s_adv_name, sizeof(s_adv_name),
-                 BUDDY_BLE_NAME_PREFIX "%02X%02X", octet[4], octet[5]);
-    } else {
-        snprintf(s_adv_name, sizeof(s_adv_name), BUDDY_BLE_NAME_PREFIX "????");
+                 BUDDY_BLE_NAME_PREFIX "%02X%02X", mac[4], mac[5]);
+        resolved = true;
     }
 
     return s_adv_name;
@@ -391,99 +523,178 @@ static void buddy_ble_start_scan(void)
 }
 
 /* ── Profile helpers ───────────────────────────────────────────── */
-/* What this badge is willing to hand another device over BLE.
+/* What this badge hands another device over BLE.
  *
- * Deliberately *not* the whole profile: this characteristic is
- * BLE_GATT_CHR_F_READ with no pairing, authentication or encryption, so
- * anything serialized here can be read by any device that comes within range
- * and connects — not just by the badge standing in front of its owner.
+ * Only what someone standing in front of you could see for themselves: how their
+ * wearer looks and what they are carrying.  Name and bio are deliberately *not*
+ * here — you do not know a stranger's name or history by looking at them, and
+ * that is what the conversation is for.  It also means this characteristic,
+ * which is BLE_GATT_CHR_F_READ with no pairing, authentication or encryption,
+ * cannot be scraped for identities or personal histories by any device that
+ * comes within range and connects.
  *
- * The character fields (appearance, belongings, traits, tech_level) are
- * therefore local-only.  They were briefly exchanged here on the theory that the
- * peer's model needed them; it does not.  Each badge speaks as its own wearer
- * from its own profile, so shipping them across the link leaked personal detail
- * to strangers while changing nothing about the conversation. */
+ * Runs on the NimBLE host task, whose stack is measured in a few kilobytes — so
+ * nothing larger than a pointer goes on the stack here.  The field buffers live
+ * in PSRAM and cJSON keeps its own heap copies of the strings. */
 static int serialize_profile(char *buf, size_t size)
 {
     const buddy_identity_t *id = buddy_identity_get();
-    buddy_profile_t *profile = heap_caps_calloc(1, sizeof(*profile), MALLOC_CAP_SPIRAM);
-    if (!profile) return -1;
-    if (buddy_profile_get(profile) != ESP_OK) {
-        heap_caps_free(profile);
-        return -1;
-    }
+    cJSON *root = NULL;
+    char *appearance = NULL;
+    char *belongings = NULL;
+    char *json = NULL;
+    int len = -1;
 
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "dn", profile->display_name);
-    cJSON_AddStringToObject(root, "bi", profile->bio);
+    appearance = heap_caps_calloc(1, BUDDY_APPEARANCE_LEN, MALLOC_CAP_SPIRAM);
+    belongings = heap_caps_calloc(1, BUDDY_BELONGINGS_LEN, MALLOC_CAP_SPIRAM);
+    if (!appearance || !belongings) goto done;
+
+    /* Read the fields straight from NVS — one open, no intermediate struct. */
+    const char *keys[] = { BUDDY_PROF_KEY_APPEARANCE, BUDDY_PROF_KEY_BELONGINGS };
+    char *outs[] = { appearance, belongings };
+    const size_t sizes[] = { BUDDY_APPEARANCE_LEN, BUDDY_BELONGINGS_LEN };
+    buddy_profile_get_fields(keys, outs, sizes, 2);
+
+    root = cJSON_CreateObject();
+    if (!root) goto done;
+
+    cJSON_AddStringToObject(root, "ap", appearance);
+    cJSON_AddStringToObject(root, "bl", belongings);
     cJSON_AddStringToObject(root, "did", id->device_id);
-    heap_caps_free(profile);
 
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json) return -1;
+    json = cJSON_PrintUnformatted(root);
+    if (!json) goto done;
 
-    int len = strlen(json);
-    if ((size_t)len >= size) len = size - 1;
+    len = (int)strlen(json);
+    if ((size_t)len >= size) len = (int)size - 1;
     memcpy(buf, json, len);
     buf[len] = '\0';
+
+done:
     free(json);
+    if (root) cJSON_Delete(root);
+    heap_caps_free(appearance);
+    heap_caps_free(belongings);
     return len;
 }
 
-static int parse_peer_profile(const char *json, buddy_profile_t *out)
+/* Pull the visible half out of a peer's profile JSON.
+ *
+ * A peer running older firmware may still send "dn" and "bi"; those are ignored —
+ * this badge learns a name from the person saying it out loud, not from a field
+ * another badge volunteered.  Writes only into the caller's buffers, never into
+ * a shared struct, so the caller decides where the memory comes from. */
+static void parse_peer_profile_into(const char *json,
+                                    char *appearance, size_t appearance_size,
+                                    char *belongings, size_t belongings_size)
 {
+    if (appearance && appearance_size) appearance[0] = '\0';
+    if (belongings && belongings_size) belongings[0] = '\0';
+    if (!json) return;
+
     cJSON *root = cJSON_Parse(json);
-    if (!root) return -1;
+    if (!root) return;
 
-    memset(out, 0, sizeof(*out));
-    cJSON *dn = cJSON_GetObjectItem(root, "dn");
-    cJSON *bi = cJSON_GetObjectItem(root, "bi");
-    /* Only what the wire carries: name, bio and the device id (read separately
-     * by the caller).  Anything else a peer might send is ignored rather than
-     * stored — including the character fields, which are local to the badge
-     * that owns them. */
+    cJSON *ap = cJSON_GetObjectItem(root, "ap");
+    cJSON *bl = cJSON_GetObjectItem(root, "bl");
 
-    if (dn && cJSON_IsString(dn))
-        snprintf(out->display_name, sizeof(out->display_name), "%s", dn->valuestring);
-    if (bi && cJSON_IsString(bi))
-        snprintf(out->bio, sizeof(out->bio), "%s", bi->valuestring);
+    if (ap && cJSON_IsString(ap) && appearance && appearance_size)
+        snprintf(appearance, appearance_size, "%s", ap->valuestring);
+    if (bl && cJSON_IsString(bl) && belongings && belongings_size)
+        snprintf(belongings, belongings_size, "%s", bl->valuestring);
 
     cJSON_Delete(root);
-    return 0;
 }
 
 /* ── Event posting ─────────────────────────────────────────────── */
 static void post_profile_event(const uint8_t *peer_mac, const char *device_id,
                                int8_t rssi, const char *profile_json)
 {
-    buddy_event_t evt = {0};
-    evt.type = BUDDY_EVT_PROFILE_READY;
-    evt.peer_profile = heap_caps_calloc(1, sizeof(buddy_profile_t), MALLOC_CAP_SPIRAM);
-    if (!evt.peer_profile) return;
+    /* On the heap, not the stack: this carries two full character fields, and
+     * the caller is the NimBLE host task, whose stack is only a few kilobytes.
+     * (A local `buddy_event_t` here is what overflowed it once already.) */
+    buddy_event_t *evt = heap_caps_calloc(1, sizeof(*evt), MALLOC_CAP_SPIRAM);
+    if (!evt) {
+        ESP_LOGW(TAG, "No memory for a profile event");
+        return;
+    }
+    evt->type = BUDDY_EVT_PROFILE_READY;
+
+    /* Parse straight into the event, which lives in PSRAM.
+     *
+     * There used to be two BUDDY_*_LEN (1 KB each) locals here holding the
+     * parsed fields before copying them into the event.  This runs on the NimBLE
+     * host task, whose stack is CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE — 4096
+     * bytes by default — so two kilobytes of it was over half the task's stack,
+     * and the overflow fired on every disconnect (which is one of the two places
+     * that calls this).  The badge then rebooted, re-advertised, was found again
+     * and started another conversation: an endless loop that looked like the
+     * chat failing to stop. */
+    if (profile_json) {
+        parse_peer_profile_into(profile_json,
+                                evt->peer_appearance, sizeof(evt->peer_appearance),
+                                evt->peer_belongings, sizeof(evt->peer_belongings));
+    }
 
     char mac_str[18];
     snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
              peer_mac[0], peer_mac[1], peer_mac[2],
              peer_mac[3], peer_mac[4], peer_mac[5]);
-    strncpy(evt.peer_device_id, device_id[0] ? device_id : mac_str,
-            sizeof(evt.peer_device_id) - 1);
+    strncpy(evt->peer_device_id, device_id[0] ? device_id : mac_str,
+            sizeof(evt->peer_device_id) - 1);
 
-    memcpy(evt.peer_mac, peer_mac, 6);
-    evt.rssi = rssi;
-    evt.proximity = buddy_proximity_classify();
-    evt.peer_profile_valid = false;
+    memcpy(evt->peer_mac, peer_mac, 6);
+    evt->rssi = rssi;
+    evt->proximity = buddy_proximity_classify();
+    evt->peer_profile_valid = (evt->peer_appearance[0] || evt->peer_belongings[0]);
 
-    if (profile_json) {
-        if (parse_peer_profile(profile_json, evt.peer_profile) == 0) {
-            evt.peer_profile_valid = true;
-        }
+    /* Keep a copy for the chat task.  The event queue is consumed by the contact
+     * task, so a dialogue cannot read it from there; and the link (with the peer
+     * it describes) is gone by the time a session ends. */
+    if (evt->peer_profile_valid) {
+        xSemaphoreTake(s_peer_profile_lock, portMAX_DELAY);
+        memcpy(s_peer_appearance, evt->peer_appearance, sizeof(s_peer_appearance));
+        memcpy(s_peer_belongings, evt->peer_belongings, sizeof(s_peer_belongings));
+        s_peer_profile_for_chat_valid = true;
+        xSemaphoreGive(s_peer_profile_lock);
     }
 
-    if (xQueueSend(s_event_queue, &evt, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Event queue full, dropping profile from %s", evt.peer_device_id);
-        heap_caps_free(evt.peer_profile);
+    if (xQueueSend(s_event_queue, evt, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Event queue full, dropping profile from %s", evt->peer_device_id);
     }
+    heap_caps_free(evt);
+}
+
+/* What the peer's badge said about its wearer, for the dialogue to use.  Only
+ * the visible half is ever stored, so these are the only outputs. */
+bool buddy_ble_peer_profile(char *appearance, size_t appearance_size,
+                            char *belongings, size_t belongings_size)
+{
+    if (!s_peer_profile_lock) return false;
+
+    xSemaphoreTake(s_peer_profile_lock, portMAX_DELAY);
+    bool ok = s_peer_profile_for_chat_valid;
+    if (ok) {
+        if (appearance && appearance_size)
+            snprintf(appearance, appearance_size, "%s", s_peer_appearance);
+        if (belongings && belongings_size)
+            snprintf(belongings, belongings_size, "%s", s_peer_belongings);
+    }
+    xSemaphoreGive(s_peer_profile_lock);
+    return ok;
+}
+
+/* Forget the peer profile: called when a link comes up, so a dialogue can never
+ * describe the person it met last time. */
+void buddy_ble_clear_peer_profile(void)
+{
+    if (!s_peer_profile_lock) return;
+
+    xSemaphoreTake(s_peer_profile_lock, portMAX_DELAY);
+    s_peer_profile_for_chat_valid = false;
+    s_peer_appearance[0] = '\0';
+    s_peer_belongings[0] = '\0';
+    xSemaphoreGive(s_peer_profile_lock);
 }
 
 /* ── Chat transport plumbing ───────────────────────────────────── */
@@ -550,6 +761,68 @@ static void chat_apply_conn_params(uint16_t conn_handle)
 }
 
 /* ── GATT client: discover and exchange profiles ────────────────── */
+/* The write is sent in chunks rather than as one long write.
+ *
+ * A profile carrying whole appearance and belongings descriptions runs to
+ * several hundred bytes, which is far more than one ATT write can hold
+ * (MTU - 3 = 244 bytes here).  "Write Long" is the textbook answer and is what
+ * this used first, but it failed against our own peripheral: the peer's ATT
+ * server answered BLE_ATT_ERR_INVALID_OFFSET (7) during the Prepare/Execute
+ * sequence, and the exchange died.  Rather than depend on a long-write
+ * implementation on both ends, the value is split into plain writes that each
+ * fit the link; the receiver accumulates them and parses on the final chunk.
+ *
+ * Format per chunk: one marker byte ('S' more to come, 'E' last), then payload.
+ * A chunk is at most BUDDY_PROF_CHUNK_MAX header-inclusive, so no chunk can ever
+ * exceed the negotiated MTU. */
+static char   *s_profile_tx = NULL;   /* whole JSON, PSRAM, freed when sent */
+static size_t  s_profile_tx_len = 0;
+static size_t  s_profile_tx_off = 0;
+
+/* Set while reading the peer's profile: true once the final chunk has been seen. */
+static bool    s_profile_rx_done = false;
+
+/* Offset the peer last asked us for, while it reads our profile in windows. */
+static uint16_t s_profile_read_offset = 0;
+
+/* The two call each other: a chunk is sent, its completion callback starts the
+ * next one. */
+static int gatt_profile_write_cb(uint16_t conn_handle,
+                                 const struct ble_gatt_error *error,
+                                 struct ble_gatt_attr *attr, void *arg);
+
+static void gatt_profile_send_chunk(uint16_t conn_handle)
+{
+    if (!s_chr_profile_write_handle || !s_profile_tx) {
+        s_conn->profile_sent = true;
+        gatt_start_read(conn_handle);
+        return;
+    }
+
+    size_t left = s_profile_tx_len - s_profile_tx_off;
+    bool last = left <= (BUDDY_PROF_CHUNK_MAX - 1);
+    size_t take = last ? left : (BUDDY_PROF_CHUNK_MAX - 1);
+
+    char *chunk = heap_caps_calloc(1, take + 1, MALLOC_CAP_SPIRAM);
+    if (!chunk) {
+        ESP_LOGW(TAG, "No memory for a profile chunk");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    chunk[0] = last ? CHAT_CHUNK_LAST : CHAT_CHUNK_MORE;
+    memcpy(chunk + 1, s_profile_tx + s_profile_tx_off, take);
+    s_profile_tx_off += take;
+
+    int rc = ble_gattc_write_flat(conn_handle, s_chr_profile_write_handle,
+                                  chunk, (uint16_t)(take + 1),
+                                  gatt_profile_write_cb, NULL);
+    heap_caps_free(chunk);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Profile chunk write failed to start: %d", rc);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
 static int gatt_profile_write_cb(uint16_t conn_handle,
                                  const struct ble_gatt_error *error,
                                  struct ble_gatt_attr *attr, void *arg)
@@ -560,8 +833,19 @@ static int gatt_profile_write_cb(uint16_t conn_handle,
         return 0;
     }
 
-    ESP_LOGI(TAG, "Profile write complete");
+    if (s_profile_tx && s_profile_tx_off < s_profile_tx_len) {
+        /* More to send — one write at a time, since NimBLE runs a single ATT
+         * client procedure at a time anyway. */
+        gatt_profile_send_chunk(conn_handle);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Profile write complete (%u bytes)", (unsigned)s_profile_tx_len);
     s_conn->profile_sent = true;
+    if (s_profile_tx) {
+        heap_caps_free(s_profile_tx);
+        s_profile_tx = NULL;
+    }
 
     /* Write done — now start the read (serialized to avoid proc limit) */
     gatt_start_read(conn_handle);
@@ -569,9 +853,46 @@ static int gatt_profile_write_cb(uint16_t conn_handle,
     return 0;
 }
 
-static int gatt_profile_read_cb(uint16_t conn_handle,
+/* Read the peer's profile in chunks, by the same scheme the write direction uses.
+ *
+ * ble_gattc_read_long() was the first attempt and the peer's ATT server answered
+ * its Read Blob request with BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN, exactly as the
+ * long write had answered INVALID_OFFSET.  Both directions of "long" ATT traffic
+ * are evidently unreliable between two copies of this firmware, so neither is
+ * used: the client asks for a window by writing a small command to the profile
+ * characteristic, and reads that window back. */
+static int  gatt_profile_chunk_cb(uint16_t conn_handle,
+                                  const struct ble_gatt_error *error,
+                                  struct ble_gatt_attr *attr, void *arg);
+static int  gatt_profile_cmd_cb(uint16_t conn_handle,
                                 const struct ble_gatt_error *error,
-                                struct ble_gatt_attr *attr, void *arg)
+                                struct ble_gatt_attr *attr, void *arg);
+static void gatt_profile_write_cmd(uint16_t conn_handle, uint16_t offset);
+
+static void gatt_profile_done(uint16_t conn_handle)
+{
+    if (s_conn->profile_len == 0) {
+        ESP_LOGW(TAG, "Peer profile came back empty");
+    } else if (s_conn->peer_flags & BUDDY_FLAG_CHAT_CAPABLE) {
+        /* A peer we will hold a conversation with: keep the link and open the
+         * chat path.  The exchange had to finish first, because the dialogue
+         * speaks about whoever is standing there, and this is the only moment
+         * that information is on the wire. */
+        ESP_LOGI(TAG, "Profile exchange complete, opening chat link...");
+        gatt_start_chat_setup(conn_handle);
+        return;
+    } else if (s_conn->profile_sent) {
+        /* Nothing further to do with this one. */
+        ESP_LOGI(TAG, "Profile exchange complete, disconnecting");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
+    }
+    s_conn->profile_len = 0;
+}
+
+static int gatt_profile_chunk_cb(uint16_t conn_handle,
+                                 const struct ble_gatt_error *error,
+                                 struct ble_gatt_attr *attr, void *arg)
 {
     if (error && error->status != 0 && error->status != BLE_HS_EDONE) {
         ESP_LOGW(TAG, "Profile read error: status=%d", error->status);
@@ -579,28 +900,98 @@ static int gatt_profile_read_cb(uint16_t conn_handle,
         return 0;
     }
 
-    /* attr == NULL means end-of-data (for read_long) or completion.
-     * For ble_gattc_read (non-long), the data comes in attr->om directly. */
-    if (!attr) {
-        /* End marker — trigger disconnect if both operations done */
-        if (s_conn->profile_len == 0) {
-            ESP_LOGW(TAG, "Profile read returned empty, disconnecting");
-            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        } else if (s_conn->profile_sent) {
-            ESP_LOGI(TAG, "Profile exchange complete, disconnecting");
-            ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        }
+    /* A successful plain read calls back exactly once, with the value in attr.
+     * There is no "end of procedure" call: NimBLE only passes attr == NULL on
+     * the error and timeout paths (see ble_gattc_read_cb(), which asserts
+     * `attr != NULL || status != 0`).  So the next window has to be requested
+     * from here — an earlier version waited for a second call that never comes,
+     * and the exchange stalled after the first window. */
+    if (!attr || !attr->om) {
+        ESP_LOGW(TAG, "Profile read returned no data (status=%d)",
+                 error ? error->status : 0);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return 0;
     }
 
-    /* Accumulate read data */
-    if (attr->om) {
-        int copy_len = OS_MBUF_PKTLEN(attr->om);
-        if (copy_len > 0 && s_conn->profile_len + copy_len < sizeof(s_conn->profile_buf)) {
-            os_mbuf_copydata(attr->om, 0, copy_len,
-                             s_conn->profile_buf + s_conn->profile_len);
-            s_conn->profile_len += copy_len;
-        }
+    uint16_t om_len = OS_MBUF_PKTLEN(attr->om);
+    if (om_len < 1) {
+        ESP_LOGW(TAG, "Profile read returned an empty window");
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    uint8_t marker = 0;
+    os_mbuf_copydata(attr->om, 0, 1, &marker);
+    s_profile_rx_done = (marker == CHAT_CHUNK_LAST);
+
+    ESP_LOGI(TAG, "Profile read window: %u bytes, marker='%c'", (unsigned)om_len,
+             (char)marker);
+
+    size_t payload = om_len - 1;
+    size_t space = sizeof(s_conn->profile_buf) - 1 - s_conn->profile_len;
+    if (payload > space) {
+        ESP_LOGW(TAG, "Peer profile exceeds %u bytes, truncated",
+                 (unsigned)(sizeof(s_conn->profile_buf) - 1));
+        payload = space;
+        s_profile_rx_done = true;
+    }
+    if (payload > 0) {
+        os_mbuf_copydata(attr->om, 1, payload,
+                         s_conn->profile_buf + s_conn->profile_len);
+        s_conn->profile_len += payload;
+    }
+    s_conn->profile_buf[s_conn->profile_len] = '\0';
+
+    ESP_LOGI(TAG, "Profile read window done: collected %u bytes, %s",
+             (unsigned)s_conn->profile_len,
+             s_profile_rx_done ? "complete" : "asking for the next window");
+
+    if (s_profile_rx_done) {
+        gatt_profile_done(conn_handle);
+    } else {
+        gatt_profile_write_cmd(conn_handle, (uint16_t)s_conn->profile_len);
+    }
+    return 0;
+}
+
+/* Ask the peer for the window starting at `offset`. */
+static void gatt_profile_write_cmd(uint16_t conn_handle, uint16_t offset)
+{
+    uint8_t cmd[3] = { PROFILE_CMD_GET, (uint8_t)(offset & 0xFF),
+                       (uint8_t)((offset >> 8) & 0xFF) };
+
+    /* s_profile_rx_done is deliberately NOT cleared here: this runs once per
+     * window, and clearing it would erase the "last window seen" state that
+     * gatt_profile_chunk_cb just set — the read would never terminate.  It is
+     * reset once in gatt_start_read(), at the start of the whole exchange. */
+
+    ESP_LOGI(TAG, "Profile read: requesting window at offset %u", (unsigned)offset);
+
+    int rc = ble_gattc_write_flat(conn_handle, s_chr_profile_write_handle,
+                                  cmd, sizeof(cmd), gatt_profile_cmd_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Profile read command failed to start: %d", rc);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
+
+static int gatt_profile_cmd_cb(uint16_t conn_handle,
+                               const struct ble_gatt_error *error,
+                               struct ble_gatt_attr *attr, void *arg)
+{
+    if (error && error->status != 0 && error->status != BLE_HS_EDONE) {
+        ESP_LOGW(TAG, "Profile read command rejected: status=%d", error->status);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Profile read command accepted, reading the window...");
+
+    int rc = ble_gattc_read(conn_handle, s_chr_profile_handle,
+                            gatt_profile_chunk_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "Profile chunk read failed to start: %d", rc);
+        ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }
     return 0;
 }
@@ -615,49 +1006,45 @@ static int gatt_svc_disc_cb(uint16_t conn_handle,
 
 static void gatt_start_exchange(uint16_t conn_handle)
 {
-    char *own_profile = heap_caps_calloc(1, BUDDY_PROFILE_MAX_BYTES, MALLOC_CAP_SPIRAM);
-    if (!own_profile) {
+    if (s_profile_tx) {                 /* a previous exchange never finished */
+        heap_caps_free(s_profile_tx);
+        s_profile_tx = NULL;
+    }
+
+    s_profile_tx = heap_caps_calloc(1, BUDDY_PROFILE_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    if (!s_profile_tx) {
         ESP_LOGE(TAG, "Failed to allocate own profile buffer");
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
-    int own_len = serialize_profile(own_profile, BUDDY_PROFILE_MAX_BYTES);
+
+    int own_len = serialize_profile(s_profile_tx, BUDDY_PROFILE_MAX_BYTES);
     if (own_len < 0) {
         ESP_LOGE(TAG, "Failed to serialize own profile");
-        heap_caps_free(own_profile);
+        heap_caps_free(s_profile_tx);
+        s_profile_tx = NULL;
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
         return;
     }
 
-    if (s_chr_profile_write_handle) {
-        int rc = ble_gattc_write_flat(conn_handle,
-            s_chr_profile_write_handle,
-            own_profile, own_len, gatt_profile_write_cb, NULL);
-        heap_caps_free(own_profile);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "Profile write failed: %d", rc);
-        }
-    } else {
-        heap_caps_free(own_profile);
-        ESP_LOGW(TAG, "Profile write handle not found, skipping write");
-        s_conn->profile_sent = true;
-        gatt_start_read(conn_handle);
-    }
+    s_profile_tx_len = (size_t)own_len;
+    s_profile_tx_off = 0;
+    gatt_profile_send_chunk(conn_handle);
 }
 
 static void gatt_start_read(uint16_t conn_handle)
 {
-    if (s_chr_profile_handle) {
-        int rc = ble_gattc_read_long(conn_handle,
-            s_chr_profile_handle, 0,
-            gatt_profile_read_cb, NULL);
-        if (rc != 0) {
-            ESP_LOGW(TAG, "ble_gattc_read_long failed: %d", rc);
-        }
-    } else {
-        ESP_LOGW(TAG, "Profile read handle not found, disconnecting");
+    if (!s_chr_profile_handle || !s_chr_profile_write_handle) {
+        ESP_LOGW(TAG, "Profile characteristics not found, disconnecting");
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+        return;
     }
+
+    /* Kick off the windowed read: our profile has already been sent, now pull
+     * theirs one window at a time (see gatt_profile_chunk_cb). */
+    s_conn->profile_len = 0;
+    s_profile_rx_done = false;
+    gatt_profile_write_cmd(conn_handle, 0);
 }
 
 /* ── GATT client: bring up the chat path ───────────────────────── */
@@ -774,9 +1161,11 @@ static int gatt_mtu_cb(uint16_t conn_handle,
     if (error && error->status != 0) {
         ESP_LOGW(TAG, "MTU exchange failed: status=%d", error->status);
     } else if (mtu > 0) {
+        /* Logged at DEBUG only: BLE_GAP_EVENT_MTU reports the same result on
+         * both roles, and this callback runs on top of it, so an INFO line here
+         * printed every negotiation twice. */
         s_att_mtu = mtu;
-        ESP_LOGI(TAG, "ATT MTU negotiated: %u (chat payload max %u)",
-                 (unsigned)s_att_mtu, (unsigned)buddy_ble_chat_max_len());
+        ESP_LOGD(TAG, "MTU exchange reported %u", (unsigned)mtu);
     }
 
     /* Carry on with discovery even if the exchange failed — the 23-byte
@@ -895,23 +1284,20 @@ static int gatt_chr_disc_cb(uint16_t conn_handle,
     }
 
     if (!chr) {
-        /* A peer that advertises chat is talked to; anything else falls back
-         * to the one-shot profile exchange. */
-        if (s_conn->peer_flags & BUDDY_FLAG_CHAT_CAPABLE) {
-            ESP_LOGI(TAG, "Characteristic discovery complete (chat=0x%04x), opening chat link...",
-                     s_peer_chat_handle);
-            gatt_start_chat_setup(conn_handle);
-            return 0;
-        }
-
+        /* Everyone exchanges profiles first, chat-capable or not.  The exchange
+         * is how the other side learns who it is dealing with — and for a peer we
+         * will hold a conversation with, it is what lets that dialogue mention
+         * the person in front of it.  The chat link opens from the exchange's
+         * completion callback rather than here, so the two never overlap on the
+         * one ATT client procedure NimBLE allows at a time. */
         if (s_chr_profile_handle == 0 && s_chr_profile_write_handle == 0) {
             ESP_LOGW(TAG, "Buddy characteristics not found, disconnecting");
             ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
-        /* Start profile exchange */
-        ESP_LOGI(TAG, "Characteristic discovery complete (read=0x%04x write=0x%04x), exchanging profiles...",
-                 s_chr_profile_handle, s_chr_profile_write_handle);
+        ESP_LOGI(TAG, "Characteristic discovery complete (profile read=0x%04x write=0x%04x, "
+                      "chat=0x%04x), exchanging profiles...",
+                 s_chr_profile_handle, s_chr_profile_write_handle, s_peer_chat_handle);
         gatt_start_exchange(conn_handle);
         return 0;
     }
@@ -950,6 +1336,24 @@ static void buddy_ble_note_peer(uint16_t conn_handle)
              desc.peer_id_addr.val[0], desc.peer_id_addr.val[1],
              desc.peer_id_addr.val[2], desc.peer_id_addr.val[3],
              desc.peer_id_addr.val[4], desc.peer_id_addr.val[5]);
+
+    /* Record the link against this peer, on both roles.
+     *
+     * This is what stops two badges from re-chatting forever, and until now only
+     * the *central* ever recorded anything (in the scan handler).  A peripheral
+     * learned its peer's identity here and then recorded nothing at all, so its
+     * side had no suppression whatsoever: as soon as the session tore the link
+     * down it immediately connected again, and the pair talked round after
+     * round.
+     *
+     * The key has to be the BLE identity address rather than the profile's
+     * device id, because that is what the scan path keys on and what shows up
+     * again in the next connection request.  buddy_ble_note_round_complete()
+     * covers the other spelling of the same peer. */
+    if (s_peers) {
+        peer_track_t *p = peer_find_or_add(desc.peer_id_addr.val);
+        p->last_conn_ms = esp_timer_get_time() / 1000LL;
+    }
 }
 
 /* ── NimBLE GAP event handler ──────────────────────────────────── */
@@ -971,10 +1375,21 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
         const uint8_t *ad = d->data;
         int ad_len = d->length_data;
         int i = 0;
-        while (i < ad_len - 1) {
+        /* Each AD structure is `field_len` bytes of payload preceded by the
+         * length byte itself, so it ends at index i + field_len.  The bound was
+         * `i + field_len >= ad_len`, which rejected the *last* structure whenever
+         * it ended exactly at the end of the buffer — i.e. a correct, complete
+         * packet was read as truncated.  A badge was only found because the
+         * manufacturer data happens to be followed by something else in our own
+         * advertising layout; move it to the end and every peer would vanish. */
+        while (i + 1 < ad_len) {
             uint8_t field_len = ad[i];
+            if (field_len == 0) break;
+
+            int next = i + 1 + field_len;
+            if (next > ad_len) break;   /* truncated structure */
+
             uint8_t field_type = ad[i + 1];
-            if (field_len == 0 || i + field_len >= ad_len) break;
 
             if (field_type == 0xFF && field_len >= 19) {
                 /* Manufacturer Specific Data */
@@ -989,7 +1404,7 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
                     }
                 }
             }
-            i += field_len + 1;
+            i = next;
         }
 
         if (!is_buddy) break;
@@ -1016,7 +1431,7 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
         }
 
         /* Check if we should connect (before updating last_ad_ms, so
-         * peer_should_connect sees the PREVIOUS ad timestamp for dedup) */
+         * peer_connect_reject_reason() sees the PREVIOUS ad timestamp for dedup) */
         /* These five gates used to be silent `break`s, which cost real
          * debugging time: a rejected advertisement left no trace at all, so
          * "no connection happened" was indistinguishable from "the radio never
@@ -1029,15 +1444,28 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
          * connections on it made a private badge unable to connect to anyone,
          * which silently killed the one-directional discovery test it was
          * being used for. */
-        const char *reject = NULL;
-        if (!peer_should_connect(d->addr.val))   reject = "peer cooldown";
-        else if (!(mfg_flags & 0x01))            reject = "peer not accepting";
-        else if (prox < BUDDY_PROX_NEAR)         reject = "not near enough";
-        else if (s_conn->active)                 reject = "already connected";
-        else if (s_conn->conn_handle != 0)       reject = "incoming link";
+        const char *reject = peer_connect_reject_reason(d->addr.val);
+        if (!reject && !(mfg_flags & 0x01))      reject = "peer not accepting";
+        else if (!reject && prox < BUDDY_PROX_NEAR) reject = "not near enough";
+        else if (!reject && s_conn->active)      reject = "already connected";
+        else if (!reject && s_conn->conn_handle != 0) reject = "incoming link";
         if (reject) {
-            ESP_LOGD(TAG, "Not connecting to %s: %s (rssi=%d flags=0x%02x prox=%s)",
-                     did, reject, rssi, mfg_flags, buddy_proximity_str(prox));
+            /* Logged at INFO for the cooldown gates: while the two badges sit
+             * next to each other these fire once per advertisement, and they are
+             * the difference between "we deliberately are not re-chatting" and
+             * "the radio never saw the peer". */
+            if (strcmp(reject, "peer cooldown") == 0) {
+                ESP_LOGI(TAG, "Not connecting to %s: %s (%d ms since it was last "
+                              "used)", did, reject,
+                         (int)(now - p->last_conn_ms));
+            } else if (strcmp(reject, "session cooldown") == 0) {
+                ESP_LOGI(TAG, "Not connecting to %s: %s (%d ms since a conversation "
+                              "ended)", did, reject,
+                         (int)(now - s_last_session_end_ms));
+            } else {
+                ESP_LOGD(TAG, "Not connecting to %s: %s (rssi=%d flags=0x%02x prox=%s)",
+                         did, reject, rssi, mfg_flags, buddy_proximity_str(prox));
+            }
             break;
         }
 
@@ -1126,6 +1554,23 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
         s_svc_start_handle = 0;
         s_svc_end_handle = 0;
         s_svc_found = false;
+
+        /* And nothing about the previous peer: until this link's exchange
+         * completes, the dialogue must not describe whoever was here last. */
+        buddy_ble_clear_peer_profile();
+
+        /* Fresh receive accumulator for the profile chunks, and no leftover
+         * outgoing profile. */
+        s_conn->profile_len = 0;
+        s_conn->profile_sent = false;
+        if (s_profile_tx) {
+            heap_caps_free(s_profile_tx);
+            s_profile_tx = NULL;
+        }
+        s_profile_tx_len = 0;
+        s_profile_tx_off = 0;
+        s_profile_rx_done = false;
+        s_profile_read_offset = 0;
 
         if (s_conn->outgoing) {
             /* Chat wants a tight, low-latency link — but only one side may ask
@@ -1297,31 +1742,73 @@ static int buddy_ble_gatt_access(uint16_t conn_handle, uint16_t attr_handle,
     const ble_uuid_t *uuid = ctxt->chr->uuid;
 
     if (ble_uuid_cmp(uuid, &g_buddy_chr_profile_uuid.u) == 0) {
-        /* READ: return our profile JSON (use PSRAM to limit stack usage) */
+        /* READ: hand back one window of our profile JSON.
+         *
+         * Not the whole value: at MTU 247 a single read response can carry about
+         * 246 bytes, and the value is several hundred.  The offset of the window
+         * was requested by the peer through a write to the write characteristic
+         * (see the PROFILE_CMD_GET branch below), which is how this firmware
+         * reads long values in both directions without relying on Read Blob or
+         * Prepare/Execute — neither of which worked between two copies of it. */
         char *profile_json = heap_caps_calloc(1, BUDDY_PROFILE_MAX_BYTES, MALLOC_CAP_SPIRAM);
         if (!profile_json) return BLE_ATT_ERR_INSUFFICIENT_RES;
+
         int len = serialize_profile(profile_json, BUDDY_PROFILE_MAX_BYTES);
         if (len < 0) {
             heap_caps_free(profile_json);
             return BLE_ATT_ERR_UNLIKELY;
         }
 
-        int rc = os_mbuf_append(ctxt->om, profile_json, len);
+        uint32_t total = (uint32_t)len;
+        uint32_t off = s_profile_read_offset;
+        if (off >= total) {
+            /* Nothing left (or nothing at all): a lone "last" marker. */
+            ESP_LOGI(TAG, "Profile read: offset %u past end (%u) — sending end marker",
+                     (unsigned)off, (unsigned)total);
+            uint8_t end = CHAT_CHUNK_LAST;
+            int end_rc = os_mbuf_append(ctxt->om, &end, 1);
+            heap_caps_free(profile_json);
+            return (end_rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+
+        uint32_t take = total - off;
+        if (take > PROFILE_READ_WINDOW) take = PROFILE_READ_WINDOW;
+        uint8_t marker = (off + take < total) ? CHAT_CHUNK_MORE : CHAT_CHUNK_LAST;
+
+        ESP_LOGI(TAG, "Profile read: window offset=%u total=%u take=%u marker='%c'",
+                 (unsigned)off, (unsigned)total, (unsigned)take, (char)marker);
+
+        int rc = os_mbuf_append(ctxt->om, &marker, 1);
+        if (rc == 0) rc = os_mbuf_append(ctxt->om, profile_json + off, take);
         heap_caps_free(profile_json);
         return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
     if (ble_uuid_cmp(uuid, &g_buddy_chr_profile_write_uuid.u) == 0) {
-        /* WRITE: peer is sending their profile (use PSRAM to limit stack usage) */
+        /* WRITE: either a read request (a small command) or one chunk of the
+         * peer's profile.  See the marker definitions at the top. */
         uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
-        if (om_len == 0 || om_len >= BUDDY_PROFILE_MAX_BYTES) {
+        if (om_len == 0 || om_len > BUDDY_PROF_CHUNK_MAX) {
+            ESP_LOGW(TAG, "Profile write of %u bytes rejected", (unsigned)om_len);
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
 
-        char *buf = heap_caps_calloc(1, BUDDY_PROFILE_MAX_BYTES, MALLOC_CAP_SPIRAM);
-        if (!buf) return BLE_ATT_ERR_INSUFFICIENT_RES;
-        os_mbuf_copydata(ctxt->om, 0, om_len, buf);
-        buf[om_len] = '\0';
+        uint8_t marker = 0;
+        os_mbuf_copydata(ctxt->om, 0, 1, &marker);
+
+        if (marker == PROFILE_CMD_GET) {
+            if (om_len != 3) {
+                ESP_LOGW(TAG, "Profile read command of %u bytes (expected 3) rejected",
+                         (unsigned)om_len);
+                return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+            }
+            uint8_t off_bytes[2] = {0};
+            os_mbuf_copydata(ctxt->om, 1, 2, off_bytes);
+            s_profile_read_offset = (uint16_t)(off_bytes[0] | (off_bytes[1] << 8));
+            ESP_LOGI(TAG, "Profile read command: next window at offset %u",
+                     (unsigned)s_profile_read_offset);
+            return 0;
+        }
 
         /* Get peer MAC from connection info */
         uint8_t peer_mac[6] = {0};
@@ -1335,9 +1822,32 @@ static int buddy_ble_gatt_access(uint16_t conn_handle, uint16_t attr_handle,
             rssi = s_conn->rssi;
         }
 
-        /* Extract device_id from profile */
+        if (om_len == 1) {
+            /* Marker-only chunk: the peer's profile is empty. */
+            post_profile_event(peer_mac, "", rssi, NULL);
+            return 0;
+        }
+
+        size_t space = sizeof(s_conn->profile_buf) - 1 - s_conn->profile_len;
+        if ((size_t)(om_len - 1) > space) {
+            ESP_LOGW(TAG, "Peer profile exceeds %u bytes, ignoring it",
+                     (unsigned)(sizeof(s_conn->profile_buf) - 1));
+            s_conn->profile_len = 0;
+            return 0;
+        }
+
+        os_mbuf_copydata(ctxt->om, 1, om_len - 1,
+                         s_conn->profile_buf + s_conn->profile_len);
+        s_conn->profile_len += om_len - 1;
+        s_conn->profile_buf[s_conn->profile_len] = '\0';
+
+        if (marker != CHAT_CHUNK_LAST) {
+            return 0;   /* more to come */
+        }
+
+        /* Extract device_id, then hand the whole thing on. */
         char did[18] = "unknown";
-        cJSON *root = cJSON_Parse(buf);
+        cJSON *root = cJSON_Parse(s_conn->profile_buf);
         if (root) {
             cJSON *didj = cJSON_GetObjectItem(root, "did");
             if (didj && cJSON_IsString(didj)) {
@@ -1346,8 +1856,8 @@ static int buddy_ble_gatt_access(uint16_t conn_handle, uint16_t attr_handle,
             cJSON_Delete(root);
         }
 
-        post_profile_event(peer_mac, did, rssi, buf);
-        heap_caps_free(buf);
+        post_profile_event(peer_mac, did, rssi, s_conn->profile_buf);
+        s_conn->profile_len = 0;
         return 0;
     }
 
@@ -1531,6 +2041,13 @@ esp_err_t buddy_ble_init(void)
     s_chat_queue = xQueueCreate(8, sizeof(buddy_chat_rx_t));
     if (!s_chat_queue) {
         ESP_LOGE(TAG, "Failed to create chat queue");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Guards the peer-profile copy shared between the host task and the chat. */
+    s_peer_profile_lock = xSemaphoreCreateMutex();
+    if (!s_peer_profile_lock) {
+        ESP_LOGE(TAG, "Failed to create peer profile lock");
         return ESP_ERR_NO_MEM;
     }
 

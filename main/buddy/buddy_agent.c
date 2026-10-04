@@ -102,7 +102,6 @@ static void buddy_contact_task(void *arg)
         if (xQueueReceive(evt_queue, &evt, portMAX_DELAY) != pdTRUE) continue;
 
         if (evt.type != BUDDY_EVT_PROFILE_READY || !evt.peer_profile_valid) {
-            heap_caps_free(evt.peer_profile);
             continue;
         }
 
@@ -127,23 +126,25 @@ static void buddy_contact_task(void *arg)
             continue;
         }
 
-        /* Store contact locally */
+        /* Store contact locally.
+         *
+         * Only the peer's device id and what was visible about its wearer: a name
+         * is not something a badge transmits, so there is none to record until
+         * the person says it out loud. */
         buddy_contact_record_t *rec = heap_caps_calloc(1, sizeof(*rec), MALLOC_CAP_SPIRAM);
-        if (!rec) { heap_caps_free(evt.peer_profile); continue; }
+        if (!rec) continue;
         snprintf(rec->peer_id, sizeof(rec->peer_id), "%s", peer_id);
-        snprintf(rec->display_name, sizeof(rec->display_name), "%s",
-                 evt.peer_profile->display_name);
-        snprintf(rec->bio, sizeof(rec->bio), "%s", evt.peer_profile->bio);
+        snprintf(rec->appearance, sizeof(rec->appearance), "%s", evt.peer_appearance);
+        snprintf(rec->belongings, sizeof(rec->belongings), "%s", evt.peer_belongings);
         buddy_contacts_upsert(rec);
         heap_caps_free(rec);
 
-        /* Nothing further to do with the profile: the old flow scored the two
-         * people against each other from their tags/vibe/open_to and sent a
-         * "Buddy Match!" notification.  Those profile fields are gone, and the
-         * meeting itself is now what gets reported — the BLE chat session
-         * forwards each turn and writes an encounter report of its own, which
-         * says far more than a similarity score did. */
-        heap_caps_free(evt.peer_profile);
+        /* Nothing further to do: the old flow scored the two people against each
+         * other from their tags/vibe/open_to and sent a "Buddy Match!"
+         * notification.  Those profile fields are gone, and the meeting itself is
+         * now what gets reported — when the chat session ends it sends the whole
+         * dialogue plus a written encounter report, which says far more than a
+         * similarity score did. */
         buddy_led_set(BUDDY_LED_PATTERN_OFF);
         vTaskDelay(pdMS_TO_TICKS(100));  /* brief gap */
     }
