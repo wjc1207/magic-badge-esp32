@@ -46,6 +46,17 @@ static esp_err_t contacts_write_all(cJSON *arr)
     char *json = cJSON_PrintUnformatted(arr);
     if (!json) return ESP_ERR_NO_MEM;
 
+    /* Rewrites the whole file every call, and there is no "did anything change"
+     * guard above it — so an upsert costs a full read plus a full rewrite of
+     * /spiffs/contacts.json even when appearance and belongings came back
+     * identical.
+     *
+     * Not a problem at the current cooldowns: two badges cannot exchange a
+     * profile more often than once per buddy_cooldown_peer_ms(), so the steady
+     * state is one write per encounter, not one per advertisement.  It would
+     * become one if the cooldown were ever shortened enough to let repeated
+     * handshakes through, or if a future caller updated contacts on every
+     * advertisement rather than on a completed exchange. */
     FILE *f = fopen(BUDDY_CONTACTS_FILE, "w");
     if (!f) { free(json); return ESP_FAIL; }
     fputs(json, f);
@@ -172,22 +183,23 @@ esp_err_t buddy_contacts_list(buddy_contact_record_t *buf, size_t max, size_t *c
 }
 
 /* ── Check status ─────────────────────────────────────────────── */
+/* Two states, not three.
+ *
+ * There used to be a RECENT state for "seen within 24 hours", and the contact
+ * task skipped storing the record when it saw one.  That made the record the
+ * peer's *first* meeting rather than its latest: last_met_unix never moved, so
+ * a pair that met every day looked like it had met once, a day ago.  The BLE
+ * layer already stops two badges from re-chatting (a three-minute cooldown per
+ * peer, plus a global one after any conversation), so this second, much longer
+ * gate bought nothing and cost accuracy. */
 buddy_contact_status_t buddy_contacts_check(const char *peer_id)
 {
     buddy_contact_record_t *rec = heap_caps_calloc(1, sizeof(*rec), MALLOC_CAP_SPIRAM);
     if (!rec) return BUDDY_CONTACT_NEW;
 
     esp_err_t err = buddy_contacts_get(peer_id, rec);
-    if (err == ESP_ERR_NOT_FOUND) {
-        heap_caps_free(rec);
-        return BUDDY_CONTACT_NEW;
-    }
-
-    int64_t now = unix_now();
-    int64_t age = now - rec->last_met_unix;
     heap_caps_free(rec);
-    if (age < 86400) return BUDDY_CONTACT_RECENT;
-    return BUDDY_CONTACT_KNOWN;
+    return (err == ESP_OK) ? BUDDY_CONTACT_KNOWN : BUDDY_CONTACT_NEW;
 }
 
 /* ── Init ─────────────────────────────────────────────────────── */

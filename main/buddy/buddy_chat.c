@@ -61,7 +61,7 @@ static const char *TAG = "buddy_chat";
 #define CHAT_MODEL_LIMIT  (CHAT_TEXT_MAX - 1)
 
 /* ── Session tuning ────────────────────────────────────────────── */
-#define CHAT_MAX_TURNS            6       /* frames per side, opening included */
+#define CHAT_MAX_TURNS            8       /* frames per side, opening included */
 #define CHAT_SESSION_MAX_MS       180000  /* hard cap on one encounter */
 #define CHAT_BUSY_INTERVAL_MS     800     /* keep-alive cadence while composing */
 #define CHAT_ADV_POLL_MS          5000    /* how often to re-check the network */
@@ -79,9 +79,17 @@ static const char *TAG = "buddy_chat";
  * timeout is this value plus the budget rather than this value alone. */
 #define CHAT_PEER_TIMEOUT_MS      (CHAT_THINK_BUDGET_MS + 20000)
 
-/* Conversation window handed to the model.  Frames carry at most CHAT_TEXT_MAX
- * bytes each, so this covers the whole 6-turn session with room to spare. */
-#define CHAT_VOICE_MAX            1024
+/* Conversation window handed to the model.
+ *
+ * Sized for the whole session, which is CHAT_MAX_TURNS lines *per side* — twelve
+ * lines in total, not six.  At the CHAT_MODEL_LIMIT ceiling a line is 160 bytes
+ * plus a speaker label, so twelve of them come to about 2 KB; 1024 bytes held
+ * roughly the second half and quietly dropped the opening, which is the part
+ * that says who these two are and why they are talking.
+ *
+ * The cost of the extra room is per turn: the whole window is re-sent with every
+ * inference, so a full session pays for it twelve times. */
+#define CHAT_VOICE_MAX            2048
 /* The whole conversation, kept separately from s_voice for the owner's report.
  *
  * s_voice is truncated oldest-first because it feeds the model every turn; a
@@ -669,19 +677,36 @@ static void chat_voice_append(const char *who, const char *text)
     size_t need = strlen(who) + strlen(text) + 4;   /* "who: text" + newline */
 
     if (used + need > sizeof(s_voice)) {
-        /* Drop the oldest lines until this one fits. */
+        /* Drop the oldest lines until this one fits.
+         *
+         * This is the only place the model's context can silently get shorter:
+         * the transcript it is handed each turn loses its opening, so the model
+         * keeps answering as if the conversation had always started mid-way.
+         * The report buffer says so when it overflows and this one did not,
+         * which made a lost opening look like the model forgetting things. */
+        size_t before = used;
         char *nl = strchr(s_voice, '\n');
         while (nl && (strlen(s_voice) + need > sizeof(s_voice))) {
             memmove(s_voice, nl + 1, strlen(nl + 1) + 1);
             nl = strchr(s_voice, '\n');
         }
         used = strlen(s_voice);
+        ESP_LOGW(TAG, "Context full: dropped %u bytes of the oldest turns to fit "
+                      "\"%s\"; %u of %u bytes now held",
+                 (unsigned)(before - used), who, (unsigned)used,
+                 (unsigned)sizeof(s_voice));
     }
 
     /* Assemble the line in a scratch buffer, then copy in as much as fits at a
      * character boundary.  Appending straight into the transcript would leave a
-     * half-written line behind whenever the copy had to stop short. */
-    char line[CHAT_VOICE_MAX];
+     * half-written line behind whenever the copy had to stop short.
+     *
+     * File scope rather than the stack: it is sized for one line, and the
+     * largest field plus the widest speaker label does not need the whole
+     * transcript's worth of room — a 2 KB local on an 8 KB task stack is the
+     * kind of thing that only shows up as a crash much later.  Both callers run
+     * on the session task, so there is no concurrent use. */
+    static char line[CHAT_TEXT_MAX + 32];
     int n = snprintf(line, sizeof(line), "%s: %s\n", who, text);
     if (n < 0) return;
 
@@ -788,7 +813,6 @@ static bool chat_think_delay(uint32_t ms)
  * came back (the session then ends cleanly rather than send an empty frame). */
 typedef struct {
     int             my_turns;
-    char            peer_text[BUDDY_CHAT_MSG_MAX + 1];
     char            system[MIMI_CONTEXT_BUF_SIZE];
     char            user[CHAT_VOICE_MAX + CHAT_TEXT_MAX + 64];
     char            reply[CHAT_TEXT_MAX];
@@ -1049,8 +1073,13 @@ static bool chat_llm_wait(chat_llm_ctx_t *ctx)
     return false;
 }
 
-static bool chat_llm_reply(int my_turns, const char *peer_text,
-                           char *out, size_t size)
+/* Builds this turn's prompt from the transcript and runs the inference.
+ *
+ * Takes no peer_text: the peer's latest line is already the tail of s_voice,
+ * which is what the prompt hands the model.  It used to take one only to copy it
+ * into the context for a "Latest line from them" tail that the prompt no longer
+ * has. */
+static bool chat_llm_reply(int my_turns, char *out, size_t size)
 {
     chat_llm_ctx_t *ctx = chat_llm_ctx();
 
@@ -1084,10 +1113,6 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
     ctx->reply[0] = '\0';
     ctx->turn_live = true;
 
-    /* Fixed-size fields in a static struct: copy in, bounded by the field. */
-    snprintf(ctx->peer_text, sizeof(ctx->peer_text), "%s",
-             peer_text ? peer_text : "");
-
     /* Nothing pre-fills the peer's name: neither badge transmits one, and a
      * contact record only holds what was visible at the time.  The name arrives
      * when the person says it, which chat_note_peer_name() picks up. */
@@ -1105,9 +1130,24 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
      * turns need it and it is the same rule: match the other person when there is
      * something to match, and otherwise write in the character's own language.
      * Its "if they have not spoken yet" half is what covers the opening turn. */
+    /* `k_size_block` carries the formatting rules, including the one that keeps
+     * stage directions out of the line.
+     *
+     * The model reaches for them unprompted: with the character cards filled in
+     * it produced things like "（坐下，盯着对方腰间的醒狮头看）……那个。是什么
+     * 魔法道具？" in 19 of 72 lines. "No preamble, no emoji, no quotes" did not
+     * cover it — an action in brackets is none of those three — and the brackets
+     * travel: they are written to the peer's screen as part of the line and they
+     * spend the byte budget that the spoken words need.
+     *
+     * Phrased as "how the character acts and looks" rather than "no brackets" so
+     * it also catches the same content written without them ("笑了笑，说："), and
+     * so a bracket a character legitimately uses is not automatically banned. */
     static const char k_size_block[] =
-        "No preamble, no emoji, no quotes.\n"
-        "in the language of Chinese";
+        "No preamble, no emoji, no quotes. No actions, expressions or stage "
+        "directions — in brackets or otherwise. Write only what the character "
+        "says out loud.\n"
+        "in the language of simplified Chinese";
 
     const char *task_block;
     const char *peer_block;
@@ -1118,10 +1158,17 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
      * and -Werror=format-truncation checks exactly that. */
     char talking_to[80] = "";
 
+    /* Neither task block names a place.
+     *
+     * The opening one used to read "a face-to-face chat in the street", which
+     * asserted a setting the prompt has no business asserting: it is the first
+     * thing the model reads about the situation, and specific enough that a
+     * scene saying anything else was arguing with it. Where there is no scene,
+     * the character should be free to be wherever they are. */
     if (my_turns == 0) {
         task_block =
-            "This is the opening line of a face-to-face chat in the street. Greet "
-            "someone you have never met and say who you are.\n";
+            "You are meeting this person for the first time. Greet them, and say "
+            "who you are.\n";
         /* The peer's visible half is available before the first word is spoken:
          * buddy_ble.c stores it when the profile exchange completes, which is
          * what opens the chat link in the first place.  Standing in front of
@@ -1130,7 +1177,7 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
         peer_block = chat_peer_character()[0] ? k_peer_block : "";
     } else {
         task_block =
-            "The other person you have never met has spoken. React to what they just said.\n";
+            "The other person you have never met before has spoken. React to what they just said.\n";
         peer_block = chat_peer_character()[0] ? k_peer_block : "";
         /* The name is only known once they have said it. */
         if (s_peer_name[0]) {
@@ -1140,7 +1187,9 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
 
     static const char *rule_block =
         "Don't reuse a prop or topic already used; if one is exhausted, move on. "
-        "Don't pretend to know something you don't know. \n";
+        "Don't pretend to know something you don't know. "
+        "Don't believe you are familiar with the other person."
+        "Don't mirror their language or behavior. You are a different character. \n";
 
     snprintf(ctx->system, MIMI_CONTEXT_BUF_SIZE,
         "You speak for %s. There is a person who wears a badge with"
@@ -1164,10 +1213,20 @@ static bool chat_llm_reply(int my_turns, const char *peer_text,
         CHAT_MODEL_LIMIT - 1, chat_bytes_to_cjk(CHAT_MODEL_LIMIT - 1),
         k_size_block);
 
+    /* The whole transcript, and nothing else.
+     *
+     * s_voice already ends with the peer's latest line — chat_wait_turn() appends
+     * it there the moment it arrives — so the old "Latest line from them:" tail
+     * printed it a second time.  That cost the model's window a whole line every
+     * turn, and the window is the thing that decides how much of the opening
+     * survives.
+     *
+     * Nothing is lost by dropping it: the line is present, in order, in the
+     * transcript.  Only a model that ignores the transcript and reads the tail
+     * would notice, and the tail is not what the prompt tells it to read. */
     snprintf(ctx->user, CHAT_VOICE_MAX + CHAT_TEXT_MAX + 64,
-             "Conversation so far:\n%s\nLatest line from them:\n%s",
-             s_voice[0] ? s_voice : "(nothing yet - you speak first)",
-             peer_text ? peer_text : "");
+             "Conversation so far:\n%s",
+             s_voice[0] ? s_voice : "(nothing yet - you speak first)");
 
     /* Drop any signal left over from a worker whose turn was abandoned.  Without
      * this, the stale count would satisfy the very first xSemaphoreTake() of
@@ -1435,7 +1494,7 @@ static bool chat_compose_reply(int my_turns, const char *peer_text,
         return false;   /* link already gone */
     }
 
-    if (!chat_llm_reply(my_turns, peer_text, out, size)) {
+    if (!chat_llm_reply(my_turns, out, size)) {
         /* Nothing usable — end cleanly rather than send an empty frame. */
         return false;
     }

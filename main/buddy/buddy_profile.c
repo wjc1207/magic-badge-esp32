@@ -21,9 +21,21 @@ static const char *TAG = "buddy_profile";
 static buddy_identity_t *s_identity = NULL;
 static buddy_privacy_mode_t s_privacy = BUDDY_MODE_PUBLIC;
 
+/* Cool-downs, cached in RAM.
+ *
+ * Cached rather than read on demand because the hot reader is
+ * peer_connect_reject_reason(), which runs from the NimBLE GAP callback for
+ * every advertisement in range — an NVS read there would put a flash access in
+ * the radio's path.  Same shape as s_privacy above. */
+static int64_t s_cooldown_peer_ms    = BUDDY_COOLDOWN_PEER_DEFAULT_MS;
+static int64_t s_cooldown_session_ms = BUDDY_COOLDOWN_SESSION_DEFAULT_MS;
+
 #define BUDDY_NVS_NS      "buddy"
 #define BUDDY_NVS_KEY_ID  "identity"
 #define BUDDY_NVS_KEY_PRIV "privacy"
+/* Cool-downs, in milliseconds.  NVS keys cap at 15 characters. */
+#define BUDDY_NVS_KEY_COOL_PEER "cool_peer"
+#define BUDDY_NVS_KEY_COOL_SESS "cool_sess"
 /* Was the single struct blob; erased on first boot under the per-field scheme.
  * Kept as a name so the cleanup can find it. */
 #define BUDDY_NVS_KEY_LEGACY_PROF "profile"
@@ -223,6 +235,23 @@ static esp_err_t profile_load(void)
     nvs_get_blob(nvs, BUDDY_NVS_KEY_PRIV, &priv, &plen);
     s_privacy = (buddy_privacy_mode_t)priv;
 
+    /* Cool-downs.  Absent on a device that has never had them set, in which case
+     * the defaults above stand.  Read as int64; anything outside the guard rails
+     * (a stale value from an older build, a hand-edited NVS) falls back rather
+     * than being honoured, so a bad stored number cannot lock the radio out. */
+    int64_t cool = 0;
+    if (nvs_get_i64(nvs, BUDDY_NVS_KEY_COOL_PEER, &cool) == ESP_OK &&
+        cool >= BUDDY_COOLDOWN_MIN_MS && cool <= BUDDY_COOLDOWN_MAX_MS) {
+        s_cooldown_peer_ms = cool;
+    }
+    if (nvs_get_i64(nvs, BUDDY_NVS_KEY_COOL_SESS, &cool) == ESP_OK &&
+        cool >= BUDDY_COOLDOWN_MIN_MS && cool <= BUDDY_COOLDOWN_MAX_MS) {
+        s_cooldown_session_ms = cool;
+    }
+    ESP_LOGI(TAG, "Cool-downs: peer %lld s, session %lld s",
+             (long long)(s_cooldown_peer_ms / 1000),
+             (long long)(s_cooldown_session_ms / 1000));
+
     char name[BUDDY_DISPLAY_NAME_LEN] = {0};
     err = profile_get_str(nvs, BUDDY_PROF_KEY_NAME, name, sizeof(name));
 
@@ -359,6 +388,43 @@ buddy_privacy_mode_t buddy_privacy_get(void)
 {
     return s_privacy;
 }
+
+/* ── Re-chat cool-downs ───────────────────────────────────────── */
+static int64_t clamp_cooldown(int64_t ms)
+{
+    if (ms < BUDDY_COOLDOWN_MIN_MS) return BUDDY_COOLDOWN_MIN_MS;
+    if (ms > BUDDY_COOLDOWN_MAX_MS) return BUDDY_COOLDOWN_MAX_MS;
+    return ms;
+}
+
+esp_err_t buddy_cooldowns_set(int64_t peer_ms, int64_t session_ms)
+{
+    s_cooldown_peer_ms    = clamp_cooldown(peer_ms);
+    s_cooldown_session_ms = clamp_cooldown(session_ms);
+
+    /* Applied to the in-memory values above before the write, so the gates
+     * change even if NVS is full or read-only: the setting is what the radio
+     * uses, and losing it across a reboot is a smaller failure than having the
+     * page report a value the firmware is not using. */
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(BUDDY_NVS_NS, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_i64(nvs, BUDDY_NVS_KEY_COOL_PEER, s_cooldown_peer_ms);
+        if (err == ESP_OK) {
+            err = nvs_set_i64(nvs, BUDDY_NVS_KEY_COOL_SESS, s_cooldown_session_ms);
+        }
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    ESP_LOGI(TAG, "Cool-downs set: peer %lld s, session %lld s",
+             (long long)(s_cooldown_peer_ms / 1000),
+             (long long)(s_cooldown_session_ms / 1000));
+    return err;
+}
+
+int64_t buddy_cooldown_peer_ms(void)    { return s_cooldown_peer_ms; }
+int64_t buddy_cooldown_session_ms(void) { return s_cooldown_session_ms; }
 
 bool buddy_profile_get_hash(uint8_t hash_out[8])
 {

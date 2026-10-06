@@ -236,7 +236,7 @@ static peer_track_t *peer_find_or_add(const uint8_t *mac)
 
         for (int i = 0; i < PEER_TRACK_MAX; i++) {
             if (s_peers[i].last_conn_ms > 0 &&
-                (now - s_peers[i].last_conn_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+                (now - s_peers[i].last_conn_ms) < buddy_cooldown_peer_ms()) {
                 continue;   /* still cooling down — protected */
             }
             if (victim < 0 ||
@@ -289,7 +289,7 @@ void buddy_ble_note_round_complete(const char *peer_device_id)
             strcmp(mac_str, peer_device_id) == 0) {
             s_peers[i].last_conn_ms = esp_timer_get_time() / 1000LL;
             ESP_LOGI(TAG, "Cooling down %s for %lld s after this conversation",
-                     peer_device_id, BUDDY_RECHAT_COOLDOWN_MS / 1000);
+                     peer_device_id, (long long)(buddy_cooldown_peer_ms() / 1000));
             return;
         }
     }
@@ -319,7 +319,7 @@ static const char *peer_connect_reject_reason(const uint8_t *mac)
      * shortcut below, which would otherwise let the very first advertisement
      * after a session straight through. */
     if (s_last_session_end_ms > 0 &&
-        (now - s_last_session_end_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+        (now - s_last_session_end_ms) < buddy_cooldown_session_ms()) {
         return "session cooldown";
     }
 
@@ -330,12 +330,14 @@ static const char *peer_connect_reject_reason(const uint8_t *mac)
 
     /* Per-peer record, which is what lets us talk to somebody *else* while this
      * one is still cooling down. */
-    if (p->last_conn_ms > 0 && (now - p->last_conn_ms) < BUDDY_RECHAT_COOLDOWN_MS) {
+    if (p->last_conn_ms > 0 && (now - p->last_conn_ms) < buddy_cooldown_peer_ms()) {
         return "peer cooldown";
     }
 
-    /* 2-second dedup */
-    if (p->last_ad_ms > 0 && (now - p->last_ad_ms) < 2000) {
+    /* 2-second dedup.  Reads BUDDY_BEACON_DEDUP_MS rather than a literal: the
+     * constant existed but nothing used it, so the number here was the real
+     * setting and the one in buddy.h was decoration. */
+    if (p->last_ad_ms > 0 && (now - p->last_ad_ms) < BUDDY_BEACON_DEDUP_MS) {
         return "advertisement dedup";
     }
 

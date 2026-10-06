@@ -33,9 +33,12 @@
  *
  * Without this they reconnect the instant the link drops — both are advertising
  * and scanning again within milliseconds — and the same couple talks round after
- * round with nobody walking anywhere.  The cooldown is per peer, so meeting a
- * different badge is unaffected, and it is cleared by reboot. */
-#define BUDDY_RECHAT_COOLDOWN_MS     (3 * 60 * 1000LL)
+ * round with nobody walking anywhere.
+ *
+ * The value is a setting now, not a constant: see BUDDY_COOLDOWN_* in buddy.h
+ * and the Character section of the config page.  Three minutes is the default,
+ * which is right for two badges sitting side by side; a pair that meets once a
+ * day wants hours. */
 #define BUDDY_BLE_SCAN_WINDOW_MS     300   /* 30% duty, was 80% */
 
 /* ── GATT service / characteristic UUIDs (128-bit) ─────────────── */

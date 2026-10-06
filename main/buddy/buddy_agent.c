@@ -120,10 +120,6 @@ static void buddy_contact_task(void *arg)
         case BUDDY_CONTACT_KNOWN:
             buddy_led_set(BUDDY_LED_PATTERN_BLUE_SLOW);
             break;
-        case BUDDY_CONTACT_RECENT:
-            /* Silent — met within 24h, don't spam */
-            ESP_LOGI(TAG, "Recent contact, skipping");
-            continue;
         }
 
         /* Store contact locally.

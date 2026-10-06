@@ -24,7 +24,11 @@
 
 /* ── Discovery limits ────────────────────────────────────────── */
 #define BUDDY_BEACON_DEDUP_MS       2000
-#define BUDDY_REHANDSHAKE_COOLDOWN_S (30 * 60)
+/* BUDDY_REHANDSHAKE_COOLDOWN_S (30 minutes) used to live here.  It was never
+ * referenced by anything, and the value that actually governs how often two
+ * badges may talk is buddy_cooldown_peer_ms() — three minutes by default, and
+ * settable from the config page.  Deleted rather than left as a trap: reading it
+ * implies a behaviour the firmware does not have. */
 
 /* ── Profile limits ──────────────────────────────────────────── */
 /* Upper bound on a profile *exchanged over BLE*: the buffer that holds the
@@ -107,7 +111,6 @@ typedef enum {
 typedef enum {
     BUDDY_CONTACT_NEW = 0,
     BUDDY_CONTACT_KNOWN,
-    BUDDY_CONTACT_RECENT,
 } buddy_contact_status_t;
 
 /* ── Privacy mode ────────────────────────────────────────────── */
@@ -253,6 +256,44 @@ esp_err_t buddy_privacy_set(buddy_privacy_mode_t mode);
  * Get current privacy mode.
  */
 buddy_privacy_mode_t buddy_privacy_get(void);
+
+/* ── Re-chat cool-downs ───────────────────────────────────────── */
+/* How long a badge waits before it will open another chat link.
+ *
+ * Two gates, both in milliseconds, both settable from the config page:
+ *
+ *   session — after *any* conversation ended, no new link to anyone.  This is
+ *             the backstop: it keys on nothing but the clock, so it still works
+ *             when peer identification gets the peer's address wrong (which is
+ *             what once let two badges talk round after round forever).
+ *   peer    — after talking to *this* peer, no new link to it.  This is the one
+ *             that sets the real pace; the session gate only ever needs to cover
+ *             the moment of disconnect.
+ *
+ * The right value depends entirely on the situation.  Side by side at an event,
+ * three minutes is right: long enough that the two badges stop reconnecting,
+ * short enough that they can talk again after walking apart and back.  For two
+ * people who meet once a day, three minutes is irrelevant and hours would be
+ * closer to the intent.  Hence the setting rather than a compile-time number. */
+#define BUDDY_COOLDOWN_PEER_DEFAULT_MS    (3 * 60 * 1000LL)
+#define BUDDY_COOLDOWN_SESSION_DEFAULT_MS (3 * 60 * 1000LL)
+/* Guard rails for anything typed into the config page.  A zero peer cool-down
+ * means two badges in range reconnect the instant a session ends, so it is not
+ * offered; the cap keeps a mistyped number from outliving the event. */
+#define BUDDY_COOLDOWN_MIN_MS             (10 * 1000LL)
+#define BUDDY_COOLDOWN_MAX_MS             (7 * 24 * 60 * 60 * 1000LL)
+
+/**
+ * Set the cool-downs. Values are clamped to the guard rails above. Persisted,
+ * and effective immediately (no restart needed for the BLE gates).
+ */
+esp_err_t buddy_cooldowns_set(int64_t peer_ms, int64_t session_ms);
+
+/** Cool-down after talking to a specific peer, in milliseconds. */
+int64_t buddy_cooldown_peer_ms(void);
+
+/** Cool-down after any conversation, in milliseconds. */
+int64_t buddy_cooldown_session_ms(void);
 
 /**
  * Look up a contact record by peer device_id.

@@ -73,11 +73,31 @@ static void json_add_effective_config_u16(cJSON *root, const char *json_key,
     cJSON_AddStringToObject(root, json_key, value);
 }
 
+/* Milliseconds from the firmware, minutes for the form.
+ *
+ * A whole number of minutes is emitted without a decimal point ("3"), because
+ * that is what the number input expects to display back and what a person
+ * types.  The 0.2-minute floor is the firmware's own minimum, not a display
+ * rounding. */
+static void json_add_effective_config_minutes(cJSON *root, const char *json_key,
+                                              int64_t ms)
+{
+    double minutes = (double)ms / 60000.0;
+    char value[16];
+
+    if (minutes == (double)(int64_t)minutes) {
+        snprintf(value, sizeof(value), "%lld", (long long)minutes);
+    } else {
+        snprintf(value, sizeof(value), "%.2f", minutes);
+    }
+
+    cJSON_AddStringToObject(root, json_key, value);
+}
+
 static void json_add_effective_config_bool(cJSON *root, const char *json_key,
                                            const char *ns, const char *nvs_key,
                                            bool build_val)
-{
-    bool value = build_val;
+{    bool value = build_val;
 
     nvs_handle_t nvs;
     if (nvs_open(ns, NVS_READONLY, &nvs) == ESP_OK) {
@@ -398,6 +418,12 @@ static esp_err_t http_get_config(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "buddy_privacy",
                           buddy_privacy_get() == BUDDY_MODE_PRIVATE);
 
+    /* Cool-downs: the form works in minutes, the firmware in milliseconds. */
+    json_add_effective_config_minutes(root, "buddy_cool_peer_min",
+                                      buddy_cooldown_peer_ms());
+    json_add_effective_config_minutes(root, "buddy_cool_session_min",
+                                      buddy_cooldown_session_ms());
+
     /* Where the last conversation came from — the config page shows it, and it
      * is also the destination every BLE-chat line is forwarded to. */
     {
@@ -540,7 +566,17 @@ static void nvs_sync_bool_field(cJSON *root, const char *json_key,
 static esp_err_t http_post_save(httpd_req_t *req)
 {
     int total_len = req->content_len;
-    if (total_len <= 0 || total_len > 4096) {
+    /* The body is the whole form, and the character fields alone are allowed to
+     * total about 5.3 KB: bio 2047 + appearance 1023 + belongings 1023 +
+     * knows 511 + traits/speech 510 + tech_level 127 + name 31, plus the JSON
+     * keys, the WiFi/LLM/bot fields and escaping.  4096 rejected a fully filled
+     * form with "Bad length" and saved nothing at all — a silent failure that
+     * looked like the page being broken.
+     *
+     * The cap is still a cap: it is what stops a hostile or malformed POST from
+     * asking for an arbitrary allocation. 8 KB leaves the character fields room
+     * to be filled completely and nothing more. */
+    if (total_len <= 0 || total_len > 8192) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
         return ESP_FAIL;
     }
@@ -632,6 +668,28 @@ static esp_err_t http_post_save(httpd_req_t *req)
                               strcmp(priv->valuestring, "1") == 0);
             }
             buddy_privacy_set(is_private ? BUDDY_MODE_PRIVATE : BUDDY_MODE_PUBLIC);
+        }
+
+        /* Cool-downs.  The form sends minutes and may send them as strings ("3")
+         * or numbers (3), so accept both; a blank field leaves the stored value
+         * alone rather than reading as "zero".  buddy_cooldowns_set() clamps
+         * whatever arrives to the firmware's guard rails, so an out-of-range
+         * number is corrected rather than rejected. */
+        int64_t cool_peer = -1, cool_sess = -1;
+
+        cJSON *cp = cJSON_GetObjectItem(root, "buddy_cool_peer_min");
+        if (cJSON_IsNumber(cp)) cool_peer = (int64_t)(cp->valuedouble * 60000.0);
+        else if (cJSON_IsString(cp) && cp->valuestring[0])
+            cool_peer = (int64_t)(atof(cp->valuestring) * 60000.0);
+
+        cJSON *cs = cJSON_GetObjectItem(root, "buddy_cool_session_min");
+        if (cJSON_IsNumber(cs)) cool_sess = (int64_t)(cs->valuedouble * 60000.0);
+        else if (cJSON_IsString(cs) && cs->valuestring[0])
+            cool_sess = (int64_t)(atof(cs->valuestring) * 60000.0);
+
+        if (cool_peer > 0 || cool_sess > 0) {
+            buddy_cooldowns_set(cool_peer > 0 ? cool_peer : buddy_cooldown_peer_ms(),
+                                cool_sess > 0 ? cool_sess : buddy_cooldown_session_ms());
         }
     }
 
