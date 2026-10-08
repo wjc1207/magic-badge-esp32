@@ -78,6 +78,26 @@
 #define BUDDY_KNOWS_LEN             512
 #define BUDDY_MAX_CONTACTS          500
 
+/* The preset scene for this badge's encounters.
+ *
+ * A scene belongs to an ENCOUNTER, not to a character: it is shared ground the
+ * two badges both stand in, which is why it is a separate card from the
+ * character card and is not exchanged over BLE — each side keeps its own and
+ * neither reads the other's.
+ *
+ * Preset, not generated. Generating a scene means a model call before the first
+ * word is spoken, which doubles the latency of every meeting and produces a
+ * different scene for each badge, so the two would no longer be standing in the
+ * same place. The owner writes one offline (the config page offers keyword
+ * generation as an external tool) and uploads it.
+ *
+ * Sized for the detailed end of what the sandbox experiments found useful: a
+ * scene with twenty-odd nameable things runs to 300-400 characters, which is
+ * ~1200 bytes in UTF-8. The sandbox measurement was blunt about why that matters
+ * — a one-line scene gives the conversation about one line of material, and the
+ * rest is carried by the cards. */
+#define BUDDY_SCENE_LEN             1280
+
 /* ── Profile NVS keys ────────────────────────────────────────── */
 /* The user profile is stored as one NVS entry per field.  NVS is a key-value
  * store, and keeping the profile as a single opaque blob meant every layout
@@ -97,6 +117,7 @@
 #define BUDDY_PROF_KEY_TECH_LEVEL  "tech_level"
 #define BUDDY_PROF_KEY_SPEECH      "speech"
 #define BUDDY_PROF_KEY_KNOWS       "knows"
+#define BUDDY_PROF_KEY_SCENE       "scene"
 #define BUDDY_PROF_KEY_HASH        "prof_hash"
 
 /* ── Proximity classes ───────────────────────────────────────── */
@@ -144,6 +165,11 @@ typedef struct {
     char     tech_level[BUDDY_TECH_LEVEL_LEN];
     char     speech[BUDDY_SPEECH_LEN];        /* dialect and register */
     char     knows[BUDDY_KNOWS_LEN];          /* the edge of what this character knows */
+    /* The preset scene, if the owner set one.  Also local only, and for a
+     * stronger reason than the fields above: the two badges are meant to be
+     * standing in the same place, so if either read the other's copy they could
+     * disagree.  A stranger's badge must not be able to describe the room. */
+    char     scene[BUDDY_SCENE_LEN];
 } buddy_profile_t;
 
 /* ── Device identity (generated once at first boot) ──────────── */

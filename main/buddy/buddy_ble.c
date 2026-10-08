@@ -64,12 +64,38 @@ typedef struct {
     char     device_id[18];
     int8_t   rssi;
     int64_t  last_ad_ms;
+    /* When the last CONVERSATION with this peer ended — nothing else.
+     *
+     * It used to be written on connection too (buddy_ble_note_peer), and since
+     * the gate reads it as "how long since we last talked", every connection
+     * started a full cool-down whether or not a word was exchanged. The two
+     * badges then locked each other out: each connection reset the timestamp,
+     * the peer saw a fresh one, refused, and the pair never got as far as a
+     * first line — which is exactly what "cannot start a chat at all" was.
+     *
+     * So there is one writer now, buddy_ble_note_round_complete(), and the
+     * connection path does not touch it. */
     int64_t  last_conn_ms;
     bool     blocked;
 } peer_track_t;
 
 static peer_track_t *s_peers = NULL;
 static int s_peer_count = 0;
+
+/* The peer we are linked to right now, if any.
+ *
+ * Set when a connection comes up and cleared when it goes down, so that a
+ * session which ends early — the link dropped, the profile exchange never
+ * finished — can still start a cool-down. That was the reason the connection
+ * path wrote the timestamp in the first place: a peripheral whose session never
+ * ran had no record at all and reconnected immediately. Storing *who* is
+ * connected separates the two facts, so the cool-down can be about the
+ * conversation without being started by the mere act of connecting. */
+static uint8_t s_active_peer_mac[6];
+static bool    s_active_peer_valid = false;
+/* Set when the session has recorded this link's cool-down itself, so the
+ * disconnect path does not record it a second time. */
+static bool    s_round_recorded = false;
 
 /* ── Connection state (single active connection) ───────────────── */
 typedef struct {
@@ -272,6 +298,11 @@ void buddy_ble_note_round_complete(const char *peer_device_id)
     /* The gate that does not depend on identifying the peer. */
     s_last_session_end_ms = esp_timer_get_time() / 1000LL;
 
+    /* The session owns this link's cool-down from here, so the disconnect that
+     * follows in a few milliseconds does not record it again. */
+    s_round_recorded = true;
+    s_active_peer_valid = false;
+
     /* Match on the device id or on the BLE address.
      *
      * These are two different strings for the same peer, and confusing them is
@@ -304,8 +335,17 @@ void buddy_ble_note_round_complete(const char *peer_device_id)
  *
  * Returned as a string so the scan path can name the specific gate, including
  * the global one — "we are deliberately not re-chatting" and "the radio never
- * saw the peer" used to look identical in the log. */
-static const char *peer_connect_reject_reason(const uint8_t *mac)
+ * saw the peer" used to look identical in the log.
+ *
+ * `incoming` selects which gates apply. The cool-downs are properties of the
+ * pairing and hold in both directions; the advertisement de-duplication is not,
+ * and applying it to an incoming link was a bug: it exists to stop one
+ * advertisement from starting two connections, and it is keyed on when *we* last
+ * processed that peer's advertisement while scanning. A peer that is advertising
+ * keeps that timestamp perpetually fresh, so every link it opened was refused
+ * with "advertisement dedup" — a badge sitting next to another one could never
+ * be the one to start a conversation. */
+static const char *peer_connect_reject_reason(const uint8_t *mac, bool incoming)
 {
     int64_t now = esp_timer_get_time() / 1000LL;
 
@@ -334,10 +374,9 @@ static const char *peer_connect_reject_reason(const uint8_t *mac)
         return "peer cooldown";
     }
 
-    /* 2-second dedup.  Reads BUDDY_BEACON_DEDUP_MS rather than a literal: the
-     * constant existed but nothing used it, so the number here was the real
-     * setting and the one in buddy.h was decoration. */
-    if (p->last_ad_ms > 0 && (now - p->last_ad_ms) < BUDDY_BEACON_DEDUP_MS) {
+    /* Scanning only. See the note above the function. */
+    if (!incoming &&
+        p->last_ad_ms > 0 && (now - p->last_ad_ms) < BUDDY_BEACON_DEDUP_MS) {
         return "advertisement dedup";
     }
 
@@ -1339,22 +1378,25 @@ static void buddy_ble_note_peer(uint16_t conn_handle)
              desc.peer_id_addr.val[2], desc.peer_id_addr.val[3],
              desc.peer_id_addr.val[4], desc.peer_id_addr.val[5]);
 
-    /* Record the link against this peer, on both roles.
+    /* Remember *who* is connected — not when we last talked to them.
      *
-     * This is what stops two badges from re-chatting forever, and until now only
-     * the *central* ever recorded anything (in the scan handler).  A peripheral
-     * learned its peer's identity here and then recorded nothing at all, so its
-     * side had no suppression whatsoever: as soon as the session tore the link
-     * down it immediately connected again, and the pair talked round after
-     * round.
+     * This is what stops two badges from re-chatting forever: until it existed,
+     * only the *central* recorded anything (in the scan handler), and a
+     * peripheral learned its peer's identity here and then recorded nothing at
+     * all, so as soon as the session tore the link down it immediately connected
+     * again.
      *
-     * The key has to be the BLE identity address rather than the profile's
-     * device id, because that is what the scan path keys on and what shows up
-     * again in the next connection request.  buddy_ble_note_round_complete()
-     * covers the other spelling of the same peer. */
+     * Storing the peer rather than a timestamp is the fix for the opposite
+     * failure. Writing last_conn_ms here made every connection look like a
+     * finished conversation, so each side refused the other for a full
+     * cool-down after any link at all — including links where nothing was said —
+     * and the two badges could not start a conversation. The timestamp is now
+     * written only by buddy_ble_note_round_complete(), on the way out of a
+     * session, and the disconnect path uses this record to start it. */
     if (s_peers) {
-        peer_track_t *p = peer_find_or_add(desc.peer_id_addr.val);
-        p->last_conn_ms = esp_timer_get_time() / 1000LL;
+        peer_find_or_add(desc.peer_id_addr.val);
+        memcpy(s_active_peer_mac, desc.peer_id_addr.val, 6);
+        s_active_peer_valid = true;
     }
 }
 
@@ -1446,7 +1488,7 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
          * connections on it made a private badge unable to connect to anyone,
          * which silently killed the one-directional discovery test it was
          * being used for. */
-        const char *reject = peer_connect_reject_reason(d->addr.val);
+        const char *reject = peer_connect_reject_reason(d->addr.val, false);
         if (!reject && !(mfg_flags & 0x01))      reject = "peer not accepting";
         else if (!reject && prox < BUDDY_PROX_NEAR) reject = "not near enough";
         else if (!reject && s_conn->active)      reject = "already connected";
@@ -1476,8 +1518,14 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "New buddy detected: %s (rssi=%d, prox=%s)",
                  did, rssi, buddy_proximity_str(prox));
 
-        /* Initiate connection — cancel scan to free the radio */
-        p->last_conn_ms = now;
+        /* Initiate connection — cancel scan to free the radio.
+         *
+         * last_conn_ms is deliberately NOT written here. It records the end of a
+         * conversation, and starting one is not that; writing it made the peer's
+         * cool-down begin the moment we dialled, so two badges that failed to
+         * exchange a single line still locked each other out for the full
+         * cool-down. s_active_peer_mac is what marks the link instead, and
+         * buddy_ble_note_peer() fills it in when the connection comes up. */
         memset(s_conn, 0, sizeof(*s_conn));
         s_conn->active = true;
         s_conn->outgoing = true;
@@ -1498,6 +1546,8 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
             }
             s_conn->active = false;
             s_conn->outgoing = false;
+            /* Never reached the peer, so there is nothing to record later. */
+            s_active_peer_valid = false;
             /* Restart scanning */
             if (s_running) buddy_ble_start_scan();
         }
@@ -1509,6 +1559,9 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGW(TAG, "Connection failed: status=%d", event->connect.status);
             s_conn->active = false;
             s_conn->outgoing = false;
+            /* No link, so no peer to cool down later. Leaving this set would let
+             * a later disconnect attribute itself to a peer we never reached. */
+            s_active_peer_valid = false;
             if (s_running) buddy_ble_start_scan();
             break;
         }
@@ -1545,6 +1598,47 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
          * live connection.  Leaving it false for the peripheral role let that
          * device keep scanning at an 80% duty cycle for the whole connection. */
         s_conn->active = true;
+
+        /* ── The cool-down has to hold in both directions ──────────────
+         *
+         * peer_connect_reject_reason() is consulted on the *scanning* path, when
+         * this badge decides whether to connect out.  An incoming connection
+         * never went through it, so a peer that was still outside its own
+         * cool-down could simply connect to us and start a conversation we had
+         * just declined to start.
+         *
+         * Two badges sitting on the same desk is exactly the case the cool-down
+         * exists for, and it was the one case where it did not apply: the
+         * scanning side logged "Not connecting ... peer cooldown" while the
+         * other side accepted the link, and the pair talked round after round
+         * with the setting apparently having no effect at all.
+         *
+         * Checked with the peer's address here rather than left to the profile
+         * exchange, because the exchange is several round-trips and by then the
+         * link is up and the session may already have been queued. */
+        if (event->connect.status == 0) {
+            /* The connect event carries no address, so ask for the descriptor.
+             * peer_id_addr is the identity address — the same one the scan path
+             * and buddy_ble_note_peer() use, which is what makes the cool-down
+             * record match. */
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->connect.conn_handle, &desc) == 0) {
+                const char *why = peer_connect_reject_reason(desc.peer_id_addr.val, true);
+                if (why) {
+                    char addr[18];
+                    snprintf(addr, sizeof(addr), "%02x:%02x:%02x:%02x:%02x:%02x",
+                             desc.peer_id_addr.val[0], desc.peer_id_addr.val[1],
+                             desc.peer_id_addr.val[2], desc.peer_id_addr.val[3],
+                             desc.peer_id_addr.val[4], desc.peer_id_addr.val[5]);
+                    ESP_LOGI(TAG, "Refusing incoming link from %s: %s", addr, why);
+                    ble_gap_terminate(event->connect.conn_handle,
+                                      BLE_ERR_REM_USER_CONN_TERM);
+                    s_conn->active = false;
+                    s_conn->conn_handle = 0;
+                    break;
+                }
+            }
+        }
 
         /* Fresh link — nothing about the previous chat path carries over. */
         s_att_mtu = BUDDY_ATT_MTU_DFLT;
@@ -1626,9 +1720,30 @@ static int buddy_ble_gap_event(struct ble_gap_event *event, void *arg)
         }
 
         /* Tell the session before its view of the link is wiped. */
+        bool chat_was_up = s_chat_link_up;
         if (s_chat_link_up) {
             chat_post(BUDDY_CHAT_RX_LINK_LOST, NULL, 0, s_conn->rssi);
         }
+
+        /* Start the cool-down for whoever this was, if a conversation was
+         * actually under way and the session did not already record it.
+         *
+         * s_chat_link_up is the right test for "we talked": it is set when the
+         * profile exchange completes and both sides can speak, so a link that
+         * died during the exchange — the case that used to leave no record at
+         * all and let the two badges reconnect instantly — still gets one, while
+         * a link that never got that far does not lock out a peer nobody said a
+         * word to.
+         *
+         * A normal session writes the same timestamp on its way out, moments
+         * before this runs; s_round_recorded keeps that from being counted
+         * twice. */
+        if (chat_was_up && !s_round_recorded && s_active_peer_valid && s_peers) {
+            peer_track_t *p = peer_find_or_add(s_active_peer_mac);
+            if (p) p->last_conn_ms = esp_timer_get_time() / 1000LL;
+        }
+        s_active_peer_valid = false;
+        s_round_recorded = false;
 
         memset(s_conn, 0, sizeof(*s_conn));
         s_att_mtu = BUDDY_ATT_MTU_DFLT;

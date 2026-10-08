@@ -815,6 +815,18 @@ static int cmd_buddy_status(int argc, char **argv)
             printf("World:  %s\n", profile->tech_level[0] ? profile->tech_level : "(not set)");
             printf("Speech: %s\n", profile->speech[0] ? profile->speech : "(not set)");
             printf("Knows:  %s\n", profile->knows[0] ? profile->knows : "(not set)");
+            /* The scene is too long to dump whole, so what is reported is whether
+             * there is one and how big it is.  The size is the useful number: a
+             * one-line scene gives the conversation about one line of material,
+             * a detailed one five to eight.  The config page shows the text. */
+            if (profile->scene[0]) {
+                size_t scene_bytes = strlen(profile->scene);
+                printf("Scene:  %u bytes%s\n", (unsigned)scene_bytes,
+                       scene_bytes < 200 ? "  (short — a detailed scene talks better)"
+                                         : "");
+            } else {
+                printf("Scene:  (not set)\n");
+            }
 
             uint8_t hash[8] = {0};
             if (buddy_profile_get_hash(hash)) {

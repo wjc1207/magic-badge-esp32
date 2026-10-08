@@ -806,6 +806,12 @@ static void utf8_sanitize_json(cJSON *node)
     }
 }
 
+/* Defined below llm_chat(), which calls it twice — once, and again when the
+ * provider answers with an empty completion. */
+static esp_err_t llm_chat_once(const char *post_data, const char *system_prompt,
+                               char *response_buf, size_t buf_size,
+                               bool *empty_out);
+
 esp_err_t llm_chat(const char *system_prompt, const char *messages_json,
                    char *response_buf, size_t buf_size)
 {
@@ -886,16 +892,67 @@ esp_err_t llm_chat(const char *system_prompt, const char *messages_json,
              s_provider, s_model, (int)strlen(post_data));
     llm_log_payload("LLM request", post_data);
 
+    /* Ask up to twice when the provider answers with nothing.
+     *
+     * deepseek-flash is a reasoning model: it can spend the whole completion on
+     * its reasoning and return `content: ""` with `finish_reason: "stop"` — not
+     * "length", because it considers itself finished. Measured on hardware, one
+     * turn of seven did that, and the turn was lost to a placeholder line.
+     *
+     * A second identical request usually produces text, and the cost is one more
+     * round-trip on a turn that would otherwise be wasted. Deliberately only one
+     * retry: the session's think budget is what decides whether a reply is still
+     * wanted, and a third attempt would spend it on a provider that is not going
+     * to answer.
+     *
+     * Only an empty completion is retried. A transport error or a non-200 is
+     * returned as it is — those have their own handling, and repeating a request
+     * the provider already rejected does not help. */
+    const int attempts = 2;
+    esp_err_t err = ESP_FAIL;
+    bool empty = false;
+
+    for (int attempt = 1; attempt <= attempts; attempt++) {
+        err = llm_chat_once(post_data, system_prompt, response_buf, buf_size, &empty);
+        if (err != ESP_OK || !empty) break;
+
+        if (attempt < attempts) {
+            ESP_LOGW(TAG, "Empty completion — asking again (%d of %d)",
+                     attempt + 1, attempts);
+        } else {
+            /* Out of attempts with nothing to show. The buffer is left empty —
+             * that is the signal the caller's fallback path keys on — and the
+             * text every other failure uses is written instead, so the log says
+             * what happened rather than showing a blank line. */
+            ESP_LOGW(TAG, "Empty completion on every attempt");
+            snprintf(response_buf, buf_size, "No response from LLM API");
+        }
+    }
+
+    free(post_data);
+    return err;
+}
+
+/* One round-trip: post `post_data`, parse the reply, extract the text.
+ *
+ * Split out of llm_chat() so a turn whose completion came back empty can be
+ * asked for again. `empty_out` distinguishes "the provider answered with
+ * nothing" (worth retrying) from a transport or HTTP failure (not).
+ */
+static esp_err_t llm_chat_once(const char *post_data, const char *system_prompt,
+                               char *response_buf, size_t buf_size,
+                               bool *empty_out)
+{
+    *empty_out = false;
+
     resp_buf_t rb;
     if (resp_buf_init(&rb, MIMI_LLM_STREAM_BUF_SIZE) != ESP_OK) {
-        free(post_data);
         snprintf(response_buf, buf_size, "Error: Out of memory");
         return ESP_ERR_NO_MEM;
     }
 
     int status = 0;
     esp_err_t err = llm_http_call(post_data, &rb, &status);
-    free(post_data);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
@@ -932,12 +989,23 @@ esp_err_t llm_chat(const char *system_prompt, const char *messages_json,
     }
     cJSON_Delete(root);
 
+    /* Nothing extracted. Report it as its own outcome rather than as an error,
+     * because the caller may want to try again — see the retry in llm_chat().
+     *
+     * This branch used to be unreachable in a way that mattered: it tested
+     * `response_buf[0] == '\0'` immediately after writing the literal
+     * "No response from LLM API" into that same buffer, so the buffer could not
+     * be empty by then and the message "No response from LLM API" — which
+     * callers match on to detect failure — was never the thing that told them.
+     * Extraction failing and a real HTTP failure were told apart only by
+     * accident, through extract_text_openai() having reset the buffer to "". */
     if (response_buf[0] == '\0') {
-        snprintf(response_buf, buf_size, "No response from LLM API");
-    } else {
-        ESP_LOGI(TAG, "LLM response: %d bytes", (int)strlen(response_buf));
+        *empty_out = true;
+        ESP_LOGW(TAG, "Provider answered with an empty completion");
+        return ESP_OK;      /* transport was fine; the content was not */
     }
 
+    ESP_LOGI(TAG, "LLM response: %d bytes", (int)strlen(response_buf));
     return ESP_OK;
 }
 

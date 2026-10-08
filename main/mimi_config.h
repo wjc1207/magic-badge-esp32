@@ -18,6 +18,24 @@
 #define MIMI_FEATURE_FEISHU_BOT 1
 #endif
 
+/* The cloud agent loop, and the task that drives it.
+ *
+ * Off because the badge does not need it and cannot afford it. It asks for a
+ * 24576-byte stack and steps down through 20/16/14/12 KB until one fits, so on a
+ * board this tight it always takes the largest block there is — and "there is"
+ * is decided at that moment, against the Feishu WebSocket and the chat
+ * composer, which between them need what is left. In one session the agent took
+ * the memory, `ws client start` failed for want of a 5 KB stack, and every turn
+ * after the third was answered from the fallback line because the composer could
+ * not find 6144 bytes in one piece.
+ *
+ * The badge's own conversation runs entirely on the chat task; nothing in
+ * buddy_chat.c calls into this. Turn it back on for the cloud-agent features
+ * (tools, cron, heartbeat), and expect the encounter budget to suffer. */
+#ifndef MIMI_FEATURE_AGENT_LOOP
+#define MIMI_FEATURE_AGENT_LOOP 0
+#endif
+
 /* Build-time secrets (highest priority, override NVS) */
 #if __has_include("mimi_secrets.h")
 #include "mimi_secrets.h"

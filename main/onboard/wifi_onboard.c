@@ -402,18 +402,37 @@ static esp_err_t http_get_config(httpd_req_t *req)
     json_add_effective_config_bool(root, "telegram_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_TELEGRAM_BOT, MIMI_FEATURE_TELEGRAM_BOT);
     json_add_effective_config_bool(root, "feishu_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_FEISHU_BOT, MIMI_FEATURE_FEISHU_BOT);
 
-    /* Buddy profile */
-    buddy_profile_t bp;
-    esp_err_t bp_err = buddy_profile_get(&bp);
-    if (bp_err == ESP_OK) {
-        cJSON_AddStringToObject(root, "buddy_name", bp.display_name);
-        cJSON_AddStringToObject(root, "buddy_bio", bp.bio);
-        cJSON_AddStringToObject(root, "buddy_appearance", bp.appearance);
-        cJSON_AddStringToObject(root, "buddy_belongings", bp.belongings);
-        cJSON_AddStringToObject(root, "buddy_traits", bp.traits);
-        cJSON_AddStringToObject(root, "buddy_tech_level", bp.tech_level);
-        cJSON_AddStringToObject(root, "buddy_speech", bp.speech);
-        cJSON_AddStringToObject(root, "buddy_knows", bp.knows);
+    /* Buddy profile.
+     *
+     * On the heap, not the stack. This struct is about 5.6 KB — bio 2048 +
+     * scene 1280 + appearance 1024 + belongings 1024 + knows 512 + the rest —
+     * and the HTTP server task has an 8 KB stack. Declaring it locally left
+     * under 3 KB for the cJSON calls in this function and for the several frames
+     * NVS pushes when it reads, and the board crashed with a LoadProhibited
+     * inside esp_flash_read while serving this very request.
+     *
+     * It is read-only here and freed before returning, so PSRAM is the right
+     * place for it: internal RAM is the scarce resource on this board, and the
+     * profile is only ever touched a few times per page load. */
+    buddy_profile_t *bp = heap_caps_calloc(1, sizeof(buddy_profile_t), MALLOC_CAP_SPIRAM);
+    if (bp) {
+        esp_err_t bp_err = buddy_profile_get(bp);
+        if (bp_err == ESP_OK) {
+            cJSON_AddStringToObject(root, "buddy_name", bp->display_name);
+            cJSON_AddStringToObject(root, "buddy_bio", bp->bio);
+            cJSON_AddStringToObject(root, "buddy_appearance", bp->appearance);
+            cJSON_AddStringToObject(root, "buddy_belongings", bp->belongings);
+            cJSON_AddStringToObject(root, "buddy_traits", bp->traits);
+            cJSON_AddStringToObject(root, "buddy_tech_level", bp->tech_level);
+            cJSON_AddStringToObject(root, "buddy_speech", bp->speech);
+            cJSON_AddStringToObject(root, "buddy_knows", bp->knows);
+            /* The preset scene, sent with the card so the page can show and edit
+             * it. It is not part of the character: a scene belongs to an
+             * encounter, and the two badges each keep their own copy rather than
+             * exchanging one. */
+            cJSON_AddStringToObject(root, "buddy_scene", bp->scene);
+        }
+        heap_caps_free(bp);
     }
     cJSON_AddBoolToObject(root, "buddy_privacy",
                           buddy_privacy_get() == BUDDY_MODE_PRIVATE);
@@ -573,10 +592,15 @@ static esp_err_t http_post_save(httpd_req_t *req)
      * form with "Bad length" and saved nothing at all — a silent failure that
      * looked like the page being broken.
      *
+     * The scene adds up to another 1.2 KB on top of that, and it is meant to be
+     * filled in at the length the sandbox experiments found useful — a scene
+     * carrying twenty-odd nameable things runs to 300-400 characters, which is
+     * over 1 KB in UTF-8.  12 KB keeps every field able to be filled completely
+     * with room for the JSON scaffolding around them.
+     *
      * The cap is still a cap: it is what stops a hostile or malformed POST from
-     * asking for an arbitrary allocation. 8 KB leaves the character fields room
-     * to be filled completely and nothing more. */
-    if (total_len <= 0 || total_len > 8192) {
+     * asking for an arbitrary allocation. */
+    if (total_len <= 0 || total_len > 12288) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
         return ESP_FAIL;
     }
@@ -635,10 +659,16 @@ static esp_err_t http_post_save(httpd_req_t *req)
     nvs_sync_bool_field(root, "telegram_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_TELEGRAM_BOT);
     nvs_sync_bool_field(root, "feishu_bot", MIMI_NVS_FEATURE, MIMI_NVS_KEY_FEISHU_BOT);
 
-    /* Buddy profile */
+    /* Buddy profile. Heap for the same reason as the GET path: this struct is
+     * 5.6 KB and the HTTP task has 8 KB of stack. */
     {
-        buddy_profile_t bp;
-        buddy_profile_get(&bp);
+        buddy_profile_t *bp = heap_caps_calloc(1, sizeof(buddy_profile_t),
+                                               MALLOC_CAP_SPIRAM);
+        if (!bp) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+            return ESP_FAIL;
+        }
+        buddy_profile_get(bp);
 
         cJSON *item;
         #define SYNC_BUDDY_FIELD(json_key, dest, maxlen) \
@@ -647,16 +677,18 @@ static esp_err_t http_post_save(httpd_req_t *req)
                 snprintf(dest, maxlen, "%s", item->valuestring); \
             }
 
-        SYNC_BUDDY_FIELD("buddy_name", bp.display_name, sizeof(bp.display_name));
-        SYNC_BUDDY_FIELD("buddy_bio", bp.bio, sizeof(bp.bio));
-        SYNC_BUDDY_FIELD("buddy_appearance", bp.appearance, sizeof(bp.appearance));
-        SYNC_BUDDY_FIELD("buddy_belongings", bp.belongings, sizeof(bp.belongings));
-        SYNC_BUDDY_FIELD("buddy_traits", bp.traits, sizeof(bp.traits));
-        SYNC_BUDDY_FIELD("buddy_tech_level", bp.tech_level, sizeof(bp.tech_level));
-        SYNC_BUDDY_FIELD("buddy_speech", bp.speech, sizeof(bp.speech));
-        SYNC_BUDDY_FIELD("buddy_knows", bp.knows, sizeof(bp.knows));
+        SYNC_BUDDY_FIELD("buddy_name", bp->display_name, sizeof(bp->display_name));
+        SYNC_BUDDY_FIELD("buddy_bio", bp->bio, sizeof(bp->bio));
+        SYNC_BUDDY_FIELD("buddy_appearance", bp->appearance, sizeof(bp->appearance));
+        SYNC_BUDDY_FIELD("buddy_belongings", bp->belongings, sizeof(bp->belongings));
+        SYNC_BUDDY_FIELD("buddy_traits", bp->traits, sizeof(bp->traits));
+        SYNC_BUDDY_FIELD("buddy_tech_level", bp->tech_level, sizeof(bp->tech_level));
+        SYNC_BUDDY_FIELD("buddy_speech", bp->speech, sizeof(bp->speech));
+        SYNC_BUDDY_FIELD("buddy_knows", bp->knows, sizeof(bp->knows));
+        SYNC_BUDDY_FIELD("buddy_scene", bp->scene, sizeof(bp->scene));
 
-        buddy_profile_set(&bp);
+        buddy_profile_set(bp);
+        heap_caps_free(bp);
 
         /* Privacy mode */
         cJSON *priv = cJSON_GetObjectItem(root, "buddy_privacy");

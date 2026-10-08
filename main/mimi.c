@@ -196,8 +196,20 @@ void app_main(void)
             MIMI_OUTBOUND_PRIO, NULL, MIMI_OUTBOUND_CORE) == pdPASS)
             ? ESP_OK : ESP_FAIL);
 
-        /* Start network-dependent services */
+        /* Start network-dependent services.
+         *
+         * The agent loop goes first when it is built in, because its stack
+         * request steps down until something fits and would otherwise take the
+         * memory the Feishu WebSocket and the chat composer need. With the loop
+         * compiled out (see MIMI_FEATURE_AGENT_LOOP) the same reasoning keeps
+         * Feishu first: it needs a fixed 5 KB and is started once, while the
+         * composer asks again every turn and can wait. */
+#if MIMI_FEATURE_AGENT_LOOP
         ESP_ERROR_CHECK(agent_loop_start());
+#else
+        ESP_LOGI(TAG, "Agent loop compiled out — its stack is left to Feishu and "
+                      "the chat composer");
+#endif
         if (mimi_feature_telegram_bot_enabled()) {
             ESP_ERROR_CHECK(telegram_bot_start());
         }
