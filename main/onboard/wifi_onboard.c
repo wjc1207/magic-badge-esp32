@@ -431,6 +431,9 @@ static esp_err_t http_get_config(httpd_req_t *req)
              * encounter, and the two badges each keep their own copy rather than
              * exchanging one. */
             cJSON_AddStringToObject(root, "buddy_scene", bp->scene);
+            /* The scene's label, which names the exported file. Local only: it
+             * never goes over BLE and is not part of the prompt. */
+            cJSON_AddStringToObject(root, "buddy_scene_name", bp->scene_name);
         }
         heap_caps_free(bp);
     }
@@ -686,6 +689,7 @@ static esp_err_t http_post_save(httpd_req_t *req)
         SYNC_BUDDY_FIELD("buddy_speech", bp->speech, sizeof(bp->speech));
         SYNC_BUDDY_FIELD("buddy_knows", bp->knows, sizeof(bp->knows));
         SYNC_BUDDY_FIELD("buddy_scene", bp->scene, sizeof(bp->scene));
+        SYNC_BUDDY_FIELD("buddy_scene_name", bp->scene_name, sizeof(bp->scene_name));
 
         buddy_profile_set(bp);
         heap_caps_free(bp);

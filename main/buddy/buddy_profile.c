@@ -324,6 +324,8 @@ esp_err_t buddy_profile_get(buddy_profile_t *out)
     profile_get_str(nvs, BUDDY_PROF_KEY_SPEECH, out->speech, sizeof(out->speech));
     profile_get_str(nvs, BUDDY_PROF_KEY_KNOWS, out->knows, sizeof(out->knows));
     profile_get_str(nvs, BUDDY_PROF_KEY_SCENE, out->scene, sizeof(out->scene));
+    profile_get_str(nvs, BUDDY_PROF_KEY_SCENE_NAME, out->scene_name,
+                    sizeof(out->scene_name));
 
     nvs_close(nvs);
     return ESP_OK;
@@ -348,6 +350,8 @@ esp_err_t buddy_profile_set(const buddy_profile_t *profile)
     if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_SPEECH, profile->speech);
     if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_KNOWS, profile->knows);
     if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_SCENE, profile->scene);
+    if (err == ESP_OK) err = profile_put_str(nvs, BUDDY_PROF_KEY_SCENE_NAME,
+                                             profile->scene_name);
 
     if (err == ESP_OK) {
         /* The beacon advertises this hash so a peer can tell this badge is not

@@ -97,6 +97,12 @@
  * — a one-line scene gives the conversation about one line of material, and the
  * rest is carried by the cards. */
 #define BUDDY_SCENE_LEN             1280
+/* A label for the scene, used to name the exported file.
+ *
+ * Not sent to the other badge and not part of the prompt: it is what makes a
+ * folder of exported scenes readable, and only the owner ever sees it. Sized
+ * like the display name because it is the same kind of thing. */
+#define BUDDY_SCENE_NAME_LEN        32
 
 /* ── Profile NVS keys ────────────────────────────────────────── */
 /* The user profile is stored as one NVS entry per field.  NVS is a key-value
@@ -118,6 +124,7 @@
 #define BUDDY_PROF_KEY_SPEECH      "speech"
 #define BUDDY_PROF_KEY_KNOWS       "knows"
 #define BUDDY_PROF_KEY_SCENE       "scene"
+#define BUDDY_PROF_KEY_SCENE_NAME  "scene_name"
 #define BUDDY_PROF_KEY_HASH        "prof_hash"
 
 /* ── Proximity classes ───────────────────────────────────────── */
@@ -170,6 +177,11 @@ typedef struct {
      * standing in the same place, so if either read the other's copy they could
      * disagree.  A stranger's badge must not be able to describe the room. */
     char     scene[BUDDY_SCENE_LEN];
+    /* What the owner calls that scene, for the exported file's name. Deliberately
+     * after `scene` and never transmitted: it labels the owner's own copy, and a
+     * scene adopted from the other badge arrives without one — the room is not
+     * theirs to name. */
+    char     scene_name[BUDDY_SCENE_NAME_LEN];
 } buddy_profile_t;
 
 /* ── Device identity (generated once at first boot) ──────────── */
